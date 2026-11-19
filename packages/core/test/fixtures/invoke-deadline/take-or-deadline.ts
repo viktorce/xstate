@@ -1,24 +1,24 @@
 import { createAsyncLogic, setup, TimeoutError } from 'xstate';
 
-/** Your own queue. `take` must stop waiting when its signal aborts. */
-export interface SignalQueue {
+/** Your own queue. `take` must stop waiting when its abort signal aborts. */
+export interface MessageQueue {
   take(signal: AbortSignal): Promise<string>;
 }
 
-export function createRetryMachine(signals: SignalQueue) {
+export function createRetryMachine(messages: MessageQueue) {
   // The logic owns the deadline. After four seconds it aborts `signal`,
   // which withdraws the pending take, and then errors with a TimeoutError.
-  const takeSignal = createAsyncLogic({
+  const takeMessage = createAsyncLogic({
     timeout: 4_000,
-    run: ({ signal }) => signals.take(signal)
+    run: ({ signal }) => messages.take(signal)
   });
 
-  return setup({ actors: { takeSignal } }).createMachine({
+  return setup({ actors: { takeMessage } }).createMachine({
     initial: 'waiting',
     states: {
       waiting: {
         invoke: {
-          src: 'takeSignal',
+          src: 'takeMessage',
           onDone: { target: 'retryNow' },
           onError: ({ event }) => ({
             target:
