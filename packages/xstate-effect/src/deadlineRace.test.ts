@@ -481,8 +481,9 @@ describe('a message that arrives before the machine handles the deadline', () =>
     'is not lost with an async logic timeout, reaching %s when it arrives %s',
     async (expectedValue, _description, messageFirst, expectedItems) => {
       // Async logic arms its own timeout through the actor system's clock.
-      // Under createEffectActor that is the core default clock, the host's
-      // setTimeout, which vitest fakes here. Effect's Clock does not see it.
+      // Under createEffectActor that is the core default clock, which calls
+      // the global setTimeout. Vitest fakes it here, and Effect's Clock does
+      // not see it.
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
       const messages = createMessageQueue();
       const machine = createMachine({
@@ -530,6 +531,7 @@ describe('a message that arrives before the machine handles the deadline', () =>
           // Moving Effect's test clock past the deadline leaves the timeout
           // armed.
           yield* TestClock.adjust('5 seconds');
+          expect(vi.getTimerCount()).toBeGreaterThanOrEqual(armedTimers);
           expect(read()).toBe('waiting');
           if (messageFirst) {
             // Settling the take before the deadline fires lets the child

@@ -100,7 +100,7 @@ describe('the documented example', () => {
       // reporting the deadline is not.
       expect(['retryNow', 'retryLater']).toContain(value);
       expect(items).toEqual(value === 'retryNow' ? [] : ['config changed']);
-      // Both timers end up on the host's setTimeout, which vitest fakes here.
+      // Both timers end up on the global setTimeout, which vitest fakes here.
       // The actor's default clock arms the deadline, and the test arms the
       // offer. Timers due at the same time fire in the order they were armed.
       expect(value).toBe(expectedValue);
