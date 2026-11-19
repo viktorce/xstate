@@ -529,9 +529,9 @@ describe('a message that arrives before the machine handles the deadline', () =>
           expect(vi.getTimerCount()).toBeGreaterThanOrEqual(armedTimers);
           if (!messageFirst) offerAtDeadline();
           // Moving Effect's test clock past the deadline leaves the timeout
-          // armed.
+          // armed. Both the deadline and the offer are still pending.
           yield* TestClock.adjust('5 seconds');
-          expect(vi.getTimerCount()).toBeGreaterThanOrEqual(armedTimers);
+          expect(vi.getTimerCount()).toBe(2);
           expect(read()).toBe('waiting');
           if (messageFirst) {
             // Settling the take before the deadline fires lets the child
