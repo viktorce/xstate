@@ -813,7 +813,7 @@ describe('@xstate/effect runtime', () => {
           const actor = yield* createEffectActor(machine);
           actor.send({ type: 'CONNECT' });
 
-          // `connecting` is entered five scheduler turns before the sleep starts.
+          // The actor enters `connecting` five scheduler turns before the sleep starts.
           yield* Deferred.await(sleeping);
           yield* TestClock.adjust('999 millis');
           expect(actor.getSnapshot().value).toBe('connecting');
@@ -827,7 +827,16 @@ describe('@xstate/effect runtime', () => {
 
   it('a timer re-entered after sendAndAwait fires at the new deadline', async () => {
     const machine = setupEffect({
-      actors: { connect: createEffectLogic(Effect.as(Effect.yieldNow, 'ok')) }
+      actors: {
+        connect: createEffectLogic(
+          Effect.gen(function* () {
+            for (let turn = 0; turn < 5; turn++) {
+              yield* Effect.yieldNow;
+            }
+            return 'ok';
+          })
+        )
+      }
     }).createMachine({
       initial: 'backoff',
       states: {
