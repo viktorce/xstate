@@ -274,7 +274,7 @@ waiting: {
 
 The same applies to any event that exits the invoking state, such as a `cancel` sent while the child is finishing.
 
-When the result must not be lost to a timer, let the child own the deadline. Async logic with its own `timeout` aborts its `signal` when the time is up, and only then errors with a `TimeoutError`. One actor decides between the two outcomes. Take an in-memory queue, where `take` removes the item and settles its promise in the same task. When the signal and the deadline arrive in separate tasks, as they do on the default clock, this logic cannot take a signal and report a deadline:
+When the result must not be lost to a timer, let the child own the deadline. Async logic with its own `timeout` aborts its `signal` when the time is up, and only then errors with a `TimeoutError`. One actor decides between the two outcomes. The example assumes an in-memory queue, where `take` removes the item and settles its promise in the same task. When the signal and the deadline arrive in separate tasks, as they do on the default clock, this logic cannot take a signal and report a deadline:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
 ```ts
