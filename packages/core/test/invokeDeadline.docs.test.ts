@@ -81,11 +81,11 @@ it('leaves a late signal in the queue when the deadline wins', async () => {
 });
 
 it.each([
-  ['the signal timer was armed first', true],
-  ['the deadline was armed first', false]
+  ['the signal timer was armed first', true, 'retryNow'],
+  ['the deadline was armed first', false, 'retryLater']
 ] as const)(
   'never consumes a signal it does not report when %s',
-  async (_description, signalFirst) => {
+  async (_description, signalFirst, expectedValue) => {
     const { queue, items } = createSignalQueue();
     const offerAtDeadline = () =>
       setTimeout(() => queue.offer('config changed'), 4_000);
@@ -98,9 +98,48 @@ it.each([
     // reporting the deadline is not.
     expect(['retryNow', 'retryLater']).toContain(value);
     expect(items).toEqual(value === 'retryNow' ? [] : ['config changed']);
+    // The default clock passes both timers to the host's setTimeout, which
+    // fires timers with the same delay in the order they were armed.
+    expect(value).toBe(expectedValue);
     actor.stop();
   }
 );
+
+it('loses a signal when take removes it and settles in a later task', async () => {
+  // Like a network request: the server removes the item at once and the
+  // response arrives 50 ms later. The deadline aborts in between.
+  const server: string[] = [];
+  let waiters: Array<() => void> = [];
+  const queue: SignalQueue & { offer(value: string): void } = {
+    offer(value) {
+      server.push(value);
+      waiters.shift()?.();
+    },
+    take(signal) {
+      return new Promise((resolvePromise, reject) => {
+        let response: ReturnType<typeof setTimeout> | undefined;
+        const remove = () => {
+          const value = server.shift()!;
+          response = setTimeout(() => resolvePromise(value), 50);
+        };
+        signal.addEventListener('abort', () => {
+          waiters = waiters.filter((candidate) => candidate !== remove);
+          clearTimeout(response);
+          reject(signal.reason);
+        });
+        if (server.length) remove();
+        else waiters.push(remove);
+      });
+    }
+  };
+  const actor = createActor(createRetryMachine(queue)).start();
+  await vi.advanceTimersByTimeAsync(3_960);
+  queue.offer('config changed');
+  await vi.advanceTimersByTimeAsync(100);
+  expect(actor.getSnapshot().value).toBe('retryLater');
+  expect(server).toEqual([]);
+  actor.stop();
+});
 
 it('drops a result that settles in the task that exits the invoking state', async () => {
   // The behavior the docs warn about: the completion and the exiting event

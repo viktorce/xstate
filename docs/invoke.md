@@ -274,7 +274,7 @@ waiting: {
 
 The same applies to any event that exits the invoking state, such as a `cancel` sent while the child is finishing.
 
-When the result must not be lost to a timer, let the child own the deadline. Async logic with its own `timeout` aborts its `signal` when the time is up, and only then errors with a `TimeoutError`. One actor decides between the two outcomes. When the signal and the deadline arrive in separate tasks, as they do on the default clock, it cannot take a signal and report a deadline:
+When the result must not be lost to a timer, let the child own the deadline. Async logic with its own `timeout` aborts its `signal` when the time is up, and only then errors with a `TimeoutError`. One actor decides between the two outcomes. Take an in-memory queue, where `take` removes the item and settles its promise in the same task. When the signal and the deadline arrive in separate tasks, as they do on the default clock, this logic cannot take a signal and report a deadline:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
 ```ts
@@ -314,18 +314,19 @@ export function createRetryMachine(signals: SignalQueue) {
 }
 ```
 
-Two rules keep this safe:
+Three rules keep this safe:
 
 - `take` must stop waiting when the signal aborts. Otherwise a stopped actor stays subscribed and takes the next item.
 - The step that consumes must be the last `await` in `run`. Work after it can still be cut off by the deadline.
+- `take` must remove the item in the same task that settles its promise. A take that removes the item in one task and settles in a later one, such as a network request, can still lose the item to the abort. The server has already removed the item, and the machine reports the deadline. Such a take needs the acknowledgement or reservation step described below.
 
 A [simulated clock](testing.md#control-time) or synchronous fake timers advanced in the same task that offers the signal can still produce the loss. The take has settled but not reported, and the deadline fires first.
 
-This removes the competing timer only. Any other transition out of the invoking state, such as `cancel`, still stops the child and drops a result it has not reported. Work that must survive that needs an acknowledgement or reservation step: the child reports what it took, and the machine commits or releases it in a transition.
+This removes the competing timer only. Any other transition out of the invoking state, such as `cancel`, still stops the child and drops a result it has not reported. Work that must survive that needs an acknowledgement or reservation step. The child reserves the item and reports it, and the machine commits the reservation in a transition. A reservation the machine never commits expires on its own, and the item returns to the queue.
 
 A deadline inside the logic also behaves differently across persistence. An `after` timer keeps its [original deadline](persistence.md#preserve-the-original-deadline) when the actor is restored. A restored async child [runs again](persistence.md#in-flight-children), so its own `timeout` restarts in full.
 
-The gap is the time between the child doing its work and the machine handling the child's completion. Its size depends on the runtime. `createActor` delivers a timer in the task that fires it and relays a child's completion in the task that settles it, so a child that finished before the timer fired wins. A timer can still land in the gap when the child keeps working after it consumes, and so can an event sent in the same task that settles what the child awaits. Under `createEffectActor` from `@xstate/effect` the machine handles events on its own fiber, and how long that takes depends on the Effect scheduler. The "Racing a deadline" section of the `@xstate/effect` actor logic guide shows the same pattern with `Effect.raceFirst`.
+The loss needs a gap. The gap is the time between the child doing its work and the machine handling the child's completion. Its size depends on the runtime. `createActor` delivers a timer in the task that fires it and relays a child's completion in the task that settles it, so a child that finished before the timer fired wins. A timer can still land in the gap when the child keeps working after it consumes, and so can an event sent in the same task that settles what the child awaits. Under `createEffectActor` from `@xstate/effect` the machine handles events on its own fiber, and how long that takes depends on the Effect scheduler. The "Racing a deadline" section of the `@xstate/effect` actor logic guide shows the same pattern with `Effect.raceFirst`.
 
 ## Referencing the child
 

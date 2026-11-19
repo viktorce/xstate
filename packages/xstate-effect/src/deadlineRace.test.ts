@@ -73,19 +73,23 @@ function run<A, E>(effect: Effect.Effect<A, E, Signals | Scope.Scope>) {
   );
 }
 
-// Records each sleep started on `clock` under `label`. `registered` resolves
-// with the first one. A fiber waiting on it resumes on a later scheduler turn,
-// after the test clock's sleep has registered synchronously.
+// Records each sleep started on `clock` under `label`. `registered` waits for
+// the first one. `doneUnsafe` resumes a waiting fiber synchronously, before
+// the test clock's sleep has registered. `registered` then yields, and the
+// sleeping fiber registers its sleep before the waiter resumes.
 function recordSleeps(clock: Clock.Clock, label: string, order: string[]) {
-  const registered = Deferred.makeUnsafe<void>();
+  const started = Deferred.makeUnsafe<void>();
   const recording: Clock.Clock = Object.create(clock);
   recording.sleep = (duration) =>
     Effect.suspend(() => {
       order.push(label);
-      Deferred.doneUnsafe(registered, Effect.void);
+      Deferred.doneUnsafe(started, Effect.void);
       return clock.sleep(duration);
     });
-  return { clock: recording, registered: Deferred.await(registered) };
+  return {
+    clock: recording,
+    registered: Deferred.await(started).pipe(Effect.andThen(Effect.yieldNow))
+  };
 }
 
 describe('racing a deadline inside the task', () => {
@@ -190,34 +194,47 @@ describe('racing a deadline inside the task', () => {
     }
   );
 
-  it('drops a signal taken after the timer event is queued', async () => {
-    const result = await run(
-      Effect.gen(function* () {
-        const signals = yield* Signals;
-        const clock = yield* Clock.Clock;
-        // Offer the signal when the `after` timer's sleep ends, before the
-        // timer offers its event to the machine.
-        let offered = 0;
-        const timerClock: Clock.Clock = Object.create(clock);
-        timerClock.sleep = (duration) =>
-          Effect.tap(clock.sleep(duration), () => {
-            offered++;
-            return Queue.offer(signals, 'config changed');
-          });
-        const actor = yield* createEffectActor(afterMachine).pipe(
-          Effect.provideService(Clock.Clock, timerClock)
-        );
-        yield* TestClock.adjust('4 seconds');
-        const snapshot = yield* waitFor(actor, (s) => s.status === 'done');
-        return {
-          value: snapshot.value,
-          offered,
-          size: yield* Queue.size(signals)
-        };
-      })
-    );
-    expect(result).toEqual({ value: 'retryLater', offered: 1, size: 0 });
-  });
+  // The same schedule loses the signal with `after` and keeps it with the
+  // deadline inside the task. In `retryMachine` the wrapped sleep is the
+  // raced `Effect.sleep`, not a state timer.
+  it.each([
+    ['an `after` timer', afterMachine, 0],
+    ['the deadline inside the task', retryMachine, 1]
+  ] as const)(
+    'with %s, reaches retryLater when the signal is offered as the sleep ends',
+    async (_description, machine, expectedSize) => {
+      const result = await run(
+        Effect.gen(function* () {
+          const signals = yield* Signals;
+          const clock = yield* Clock.Clock;
+          // Offer the signal when the sleep ends, before the sleeping fiber
+          // reports to the machine.
+          let offered = 0;
+          const timerClock: Clock.Clock = Object.create(clock);
+          timerClock.sleep = (duration) =>
+            Effect.tap(clock.sleep(duration), () => {
+              offered++;
+              return Queue.offer(signals, 'config changed');
+            });
+          const actor = yield* createEffectActor(machine).pipe(
+            Effect.provideService(Clock.Clock, timerClock)
+          );
+          yield* TestClock.adjust('4 seconds');
+          const snapshot = yield* waitFor(actor, (s) => s.status === 'done');
+          return {
+            value: snapshot.value,
+            offered,
+            size: yield* Queue.size(signals)
+          };
+        })
+      );
+      expect(result).toEqual({
+        value: 'retryLater',
+        offered: 1,
+        size: expectedSize
+      });
+    }
+  );
 
   it('still drops a signal when another event exits the invoking state', async () => {
     const result = await run(
