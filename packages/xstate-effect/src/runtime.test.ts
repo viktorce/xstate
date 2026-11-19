@@ -31,6 +31,7 @@ import {
   createEffectStreamLogic,
   setupEffect,
   join,
+  waitFor,
   withActorScope
 } from './index.ts';
 
@@ -656,6 +657,82 @@ describe('@xstate/effect runtime', () => {
           );
 
           expect(actor.getSnapshot().value).toBe('yellow');
+        })
+      ).pipe(Effect.provide(TestClock.layer()))
+    );
+  });
+
+  it.each([
+    ['completes at once', Effect.succeed('ok')],
+    ['yields to the scheduler', Effect.as(Effect.yieldNow, 'ok')],
+    [
+      'awaits a host timer',
+      Effect.promise(
+        () => new Promise<string>((resolve) => setTimeout(resolve, 0, 'ok'))
+      )
+    ]
+  ])(
+    'fires a timer that follows an invoked Effect which %s at its deadline',
+    async (_, work) => {
+      const machine = setupEffect({
+        actors: { connect: createEffectLogic(work) }
+      }).createMachine({
+        initial: 'idle',
+        states: {
+          idle: { on: { CONNECT: { target: 'connecting' } } },
+          connecting: {
+            invoke: { src: 'connect', onDone: { target: 'backoff' } }
+          },
+          backoff: { after: { 3000: { target: 'retrying' } } },
+          retrying: {}
+        }
+      });
+
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const actor = yield* createEffectActor(machine);
+            actor.send({ type: 'CONNECT' });
+
+            // The clock only wakes timers that exist when it advances.
+            yield* waitFor(actor, (state) => state.matches('backoff'));
+            yield* TestClock.adjust('2999 millis');
+            expect(actor.getSnapshot().value).toBe('backoff');
+
+            // A timer started late would not be due yet.
+            yield* TestClock.adjust('1 millis');
+            yield* waitFor(actor, (state) => state.matches('retrying'));
+          })
+        ).pipe(Effect.provide(TestClock.layer()))
+      );
+    }
+  );
+
+  it('fires two timers around an invoked Effect with one clock advance each', async () => {
+    const machine = setupEffect({
+      actors: { work: createEffectLogic(Effect.as(Effect.yieldNow, 'ok')) }
+    }).createMachine({
+      initial: 'first',
+      states: {
+        first: { after: { 1000: { target: 'working' } } },
+        working: { invoke: { src: 'work', onDone: { target: 'second' } } },
+        second: { after: { 1000: { target: 'done' } } },
+        done: {}
+      }
+    });
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const actor = yield* createEffectActor(machine);
+
+          yield* TestClock.adjust('1 second');
+          yield* waitFor(actor, (state) => state.matches('second'));
+          yield* TestClock.adjust('999 millis');
+          expect(actor.getSnapshot().value).toBe('second');
+
+          yield* TestClock.adjust('1 millis');
+          yield* waitFor(actor, (state) => state.matches('done'));
         })
       ).pipe(Effect.provide(TestClock.layer()))
     );
