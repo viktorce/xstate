@@ -776,6 +776,46 @@ describe('@xstate/effect runtime', () => {
     );
   });
 
+  it('a sleep inside an invoked Effect that yields first wakes once the Effect signals the test', async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const sleeping = yield* Deferred.make<void>();
+          const connect = createEffectLogic(
+            Effect.gen(function* () {
+              for (let turn = 0; turn < 5; turn++) {
+                yield* Effect.yieldNow;
+              }
+              yield* Deferred.succeed(sleeping, undefined);
+              yield* Effect.sleep('1 second');
+              return 'ok';
+            })
+          );
+          const machine = setupEffect({ actors: { connect } }).createMachine({
+            initial: 'idle',
+            states: {
+              idle: { on: { CONNECT: { target: 'connecting' } } },
+              connecting: {
+                invoke: { src: 'connect', onDone: { target: 'connected' } }
+              },
+              connected: {}
+            }
+          });
+          const actor = yield* createEffectActor(machine);
+          actor.send({ type: 'CONNECT' });
+
+          // `connecting` is entered five scheduler turns before the sleep starts.
+          yield* Deferred.await(sleeping);
+          yield* TestClock.adjust('999 millis');
+          expect(actor.getSnapshot().value).toBe('connecting');
+
+          yield* TestClock.adjust('1 millis');
+          yield* waitFor(actor, (state) => state.matches('connected'));
+        })
+      ).pipe(Effect.provide(TestClock.layer()))
+    );
+  });
+
   it('a timer re-entered after sendAndAwait fires at the new deadline', async () => {
     const machine = setupEffect({
       actors: { connect: createEffectLogic(Effect.as(Effect.yieldNow, 'ok')) }
