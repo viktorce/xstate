@@ -322,7 +322,7 @@ Three rules keep this safe:
 
 A [simulated clock](testing.md#control-time) or synchronous fake timers advanced in the same task that offers the signal can still produce the loss. The take has settled but not reported, and the deadline fires first.
 
-This removes the competing timer only. Any other transition out of the invoking state, such as `cancel`, still stops the child and drops a result it has not reported. Work that must survive that needs an acknowledgement or reservation step. The child reserves the item and reports it, and the machine commits the reservation in a transition. A reservation the machine never commits expires on its own, and the item returns to the queue.
+This removes the competing timer only. Any other transition out of the invoking state, such as `cancel`, still stops the child and drops a result it has not reported. Work that must survive that needs an acknowledgement or reservation step. The child reserves the item and reports it, and the machine commits the reservation in a transition. The queue must expire a reservation the machine never commits and return the item.
 
 A deadline inside the logic also behaves differently across persistence. An `after` timer keeps its [original deadline](persistence.md#preserve-the-original-deadline) when the actor is restored. A restored async child [runs again](persistence.md#in-flight-children), so its own `timeout` restarts in full.
 

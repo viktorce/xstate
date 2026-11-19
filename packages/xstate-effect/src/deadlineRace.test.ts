@@ -236,6 +236,74 @@ describe('racing a deadline inside the task', () => {
     }
   );
 
+  // The docs warn against a raced branch that keeps working after the take.
+  // The signal arrives at 3.5 seconds, so the deadline lands inside that work.
+  it.each([
+    [
+      'maps the signal synchronously',
+      (signal: string) => Effect.succeed({ kind: 'signal' as const, signal }),
+      'retryNow'
+    ],
+    [
+      'keeps working for a second',
+      (signal: string) =>
+        Effect.sleep('1 second').pipe(
+          Effect.as({ kind: 'signal' as const, signal })
+        ),
+      'retryLater'
+    ]
+  ] as const)(
+    'with a take branch that %s after the take, empties the queue and reaches %s',
+    async (_description, afterTake, expectedValue) => {
+      const nextSignal = createEffectLogic(
+        Signals.use((signals) =>
+          Effect.raceFirst(
+            Queue.take(signals).pipe(Effect.flatMap(afterTake)),
+            Effect.sleep('4 seconds').pipe(
+              Effect.as({ kind: 'deadline' as const })
+            )
+          )
+        )
+      );
+      const machine = setupEffect({ actors: { nextSignal } }).createMachine({
+        initial: 'waiting',
+        states: {
+          waiting: {
+            invoke: {
+              src: 'nextSignal',
+              onDone: ({ event }) => ({
+                target:
+                  event.output.kind === 'signal' ? 'retryNow' : 'retryLater'
+              })
+            }
+          },
+          retryNow: { type: 'final' },
+          retryLater: { type: 'final' }
+        }
+      });
+      const result = await run(
+        Effect.gen(function* () {
+          const signals = yield* Signals;
+          const deadline = recordSleeps(yield* Clock.Clock, 'deadline', []);
+          const actor = yield* createEffectActor(machine).pipe(
+            Effect.provideService(Clock.Clock, deadline.clock)
+          );
+          yield* deadline.registered;
+          yield* TestClock.adjust('3500 millis');
+          const offered = yield* Queue.offer(signals, 'config changed');
+          yield* TestClock.adjust('1 second');
+          const snapshot = yield* waitFor(actor, (s) => s.status === 'done');
+          return {
+            value: snapshot.value,
+            offered,
+            size: yield* Queue.size(signals)
+          };
+        })
+      );
+      expect(result).toEqual({ value: expectedValue, offered: true, size: 0 });
+    }
+  );
+
   it('still drops a signal when another event exits the invoking state', async () => {
     const result = await run(
       Effect.gen(function* () {

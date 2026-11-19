@@ -98,8 +98,9 @@ it.each([
     // reporting the deadline is not.
     expect(['retryNow', 'retryLater']).toContain(value);
     expect(items).toEqual(value === 'retryNow' ? [] : ['config changed']);
-    // The default clock passes both timers to the host's setTimeout, which
-    // fires timers with the same delay in the order they were armed.
+    // Both timers end up on the host's setTimeout, which vitest fakes here.
+    // The actor's default clock arms the deadline, and the test arms the
+    // offer. Timers due at the same time fire in the order they were armed.
     expect(value).toBe(expectedValue);
     actor.stop();
   }
