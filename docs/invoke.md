@@ -294,7 +294,11 @@ On `createActor` with the default clock and real timers, a child that follows th
 
 ### A deadline inside the logic
 
-Async logic with its own `timeout` aborts the abort signal passed to `run` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, so the result does not depend on how the host delivers the timer and the completion. This holds under `createEffectActor` as well. There the timeout runs on the host's `setTimeout`, not on Effect's `Clock`, so `TestClock` does not advance it. In an Effect task, race the deadline inside the task instead, as the [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) section shows. On `createActor`, the first two ways listed in [when the loss happens](#when-the-loss-happens) still need the rules above. The third way needs the reservation step. With a simulated clock or fake timers, you can also advance the clock in a separate task from the one that settles the take. The example assumes an in-memory queue, where `take` removes the item and settles its promise in the same task:
+Async logic with its own `timeout` aborts the abort signal passed to `run` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, so the result does not depend on how the host delivers the timer and the completion. This holds under `createEffectActor` as well. There the timeout runs on the host's `setTimeout`, not on Effect's `Clock`, so `TestClock` does not advance it. In an Effect task, race the deadline inside the task instead, as the [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) section of the `@xstate/effect` actor logic guide shows.
+
+A deadline inside the logic does not remove the ways the loss happens on `createActor`. The first two ways listed in [when the loss happens](#when-the-loss-happens) still need the rules above. The third way needs the reservation step. With a simulated clock or fake timers, you can also advance the clock in a separate task from the one that settles the take.
+
+The example assumes an in-memory queue, where `take` removes the item and settles its promise in the same task:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
 ```ts
@@ -339,8 +343,6 @@ export function createRetryMachine(messages: MessageQueue) {
 A deadline inside the logic removes the competing timer only. Any other transition out of the invoking state, such as a `cancel` sent while the child is finishing, still stops the child and drops a result it has not reported. Work that must survive that needs an acknowledgement or reservation step. The child reserves the item and reports it, and the machine commits the reservation in a transition. The queue must expire a reservation the machine never commits and make the item available again.
 
 A deadline inside the logic also behaves differently across persistence. An `after` timer keeps its [original deadline](persistence.md#preserve-the-original-deadline) when the actor is restored. A restored async child [runs again](persistence.md#in-flight-children), so its own `timeout` restarts in full.
-
-The [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) section of the `@xstate/effect` actor logic guide shows the same pattern with `Effect.raceFirst`.
 
 ## Referencing the child
 
