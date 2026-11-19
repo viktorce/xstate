@@ -29,6 +29,7 @@ import {
   createEffectLogic,
   createEffectEventStreamLogic,
   createEffectStreamLogic,
+  sendAndAwait,
   setupEffect,
   join,
   waitFor,
@@ -672,7 +673,7 @@ describe('@xstate/effect runtime', () => {
       )
     ]
   ])(
-    'fires a timer that follows an invoked Effect which %s at its deadline',
+    'a timer after an invoked Effect that %s fires at its deadline',
     async (_, work) => {
       const machine = setupEffect({
         actors: { connect: createEffectLogic(work) }
@@ -694,7 +695,7 @@ describe('@xstate/effect runtime', () => {
             const actor = yield* createEffectActor(machine);
             actor.send({ type: 'CONNECT' });
 
-            // The clock only wakes timers that exist when it advances.
+            // TestClock.adjust does not wait for the actor to reach the timer's state.
             yield* waitFor(actor, (state) => state.matches('backoff'));
             yield* TestClock.adjust('2999 millis');
             expect(actor.getSnapshot().value).toBe('backoff');
@@ -708,7 +709,7 @@ describe('@xstate/effect runtime', () => {
     }
   );
 
-  it('fires two timers around an invoked Effect with one clock advance each', async () => {
+  it('two timers around an invoked Effect fire with one clock advance each', async () => {
     const machine = setupEffect({
       actors: { work: createEffectLogic(Effect.as(Effect.yieldNow, 'ok')) }
     }).createMachine({
@@ -733,6 +734,79 @@ describe('@xstate/effect runtime', () => {
 
           yield* TestClock.adjust('1 millis');
           yield* waitFor(actor, (state) => state.matches('done'));
+        })
+      ).pipe(Effect.provide(TestClock.layer()))
+    );
+  });
+
+  it('a timer after an invoked Effect that sleeps on the clock fires at its deadline', async () => {
+    const machine = setupEffect({
+      actors: {
+        connect: createEffectLogic(Effect.as(Effect.sleep('1 second'), 'ok'))
+      }
+    }).createMachine({
+      initial: 'idle',
+      states: {
+        idle: { on: { CONNECT: { target: 'connecting' } } },
+        connecting: {
+          invoke: { src: 'connect', onDone: { target: 'backoff' } }
+        },
+        backoff: { after: { 3000: { target: 'retrying' } } },
+        retrying: {}
+      }
+    });
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const actor = yield* createEffectActor(machine);
+          actor.send({ type: 'CONNECT' });
+
+          // The invoked sleep needs its own clock advance.
+          yield* waitFor(actor, (state) => state.matches('connecting'));
+          yield* TestClock.adjust('1 second');
+          yield* waitFor(actor, (state) => state.matches('backoff'));
+          yield* TestClock.adjust('2999 millis');
+          expect(actor.getSnapshot().value).toBe('backoff');
+
+          yield* TestClock.adjust('1 millis');
+          yield* waitFor(actor, (state) => state.matches('retrying'));
+        })
+      ).pipe(Effect.provide(TestClock.layer()))
+    );
+  });
+
+  it('a timer re-entered after sendAndAwait fires at the new deadline', async () => {
+    const machine = setupEffect({
+      actors: { connect: createEffectLogic(Effect.as(Effect.yieldNow, 'ok')) }
+    }).createMachine({
+      initial: 'backoff',
+      states: {
+        backoff: {
+          after: { 3000: { target: 'retrying' } },
+          on: { RESTART: { target: 'connecting' } }
+        },
+        connecting: {
+          invoke: { src: 'connect', onDone: { target: 'backoff' } }
+        },
+        retrying: {}
+      }
+    });
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const actor = yield* createEffectActor(machine);
+          yield* TestClock.adjust('1 second');
+
+          // Without the receipt, waitFor would match the first backoff.
+          yield* sendAndAwait(actor, { type: 'RESTART' });
+          yield* waitFor(actor, (state) => state.matches('backoff'));
+          yield* TestClock.adjust('2999 millis');
+          expect(actor.getSnapshot().value).toBe('backoff');
+
+          yield* TestClock.adjust('1 millis');
+          yield* waitFor(actor, (state) => state.matches('retrying'));
         })
       ).pipe(Effect.provide(TestClock.layer()))
     );

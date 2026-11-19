@@ -9,7 +9,8 @@ import {
 
 let attempts = 0;
 const connect = createEffectLogic(
-  // Like real I/O, an attempt takes at least one scheduler turn.
+  // The yield stands in for real I/O. It is why the test below must wait for
+  // `backoff` before it advances the clock.
   Effect.yieldNow.pipe(
     Effect.andThen(
       Effect.suspend(() => {
