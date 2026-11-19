@@ -167,7 +167,7 @@ console.log(result); // 'retryNow'
 - The deadline restarts in full when the actor is restored, because a running Effect task starts again from the beginning. An `after` timer keeps its original deadline. See [persisting and restoring](actors.md#persisting-and-restoring).
 - Keep `after` and `timeout` for work that is safe to repeat or abandon.
 
-The core guide covers the same race for `createAsyncLogic` in [racing an invocation against a timer](../../../docs/invoke.md#racing-an-invocation-against-a-timer).
+The core guide covers the same race for `createAsyncLogic` in [racing an invocation against a timer](../../../docs/invoke.md#racing-an-invocation-against-a-timer). A `createAsyncLogic` `timeout` does not run on Effect's `Clock`, so `TestClock` does not advance it.
 
 ## `createEffectStreamLogic`
 

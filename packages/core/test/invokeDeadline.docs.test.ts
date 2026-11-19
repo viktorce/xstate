@@ -4,7 +4,8 @@ import {
   createActor,
   createAsyncLogic,
   createMachine,
-  SimulatedClock
+  SimulatedClock,
+  TimeoutError
 } from '../src/index.ts';
 import {
   createRetryMachine,
@@ -114,6 +115,7 @@ describe('the documented example', () => {
     clock.increment(3_999);
     queue.offer('config changed');
     await vi.advanceTimersByTimeAsync(0);
+    expect(actor.getSnapshot().value).toBe('retryNow');
     clock.increment(1);
     expect(actor.getSnapshot().value).toBe('retryNow');
     expect(items).toEqual([]);
@@ -130,8 +132,10 @@ describe('the documented example', () => {
 });
 
 // The docs say a child that follows the three rules does not lose a result
-// to a machine timer on createActor with the default clock. These machines
-// have no deadline in the logic, only a take-only, abort-aware child.
+// to a machine timer on createActor with the default clock and real timers.
+// The async fake-timer API yields between timers the way real timers do.
+// These machines have no deadline in the logic, only a take-only,
+// abort-aware child.
 describe.each([
   [
     'after',
@@ -261,6 +265,61 @@ describe('ways the documented example still loses a message', () => {
     queue.offer('config changed');
     clock.increment(1);
     await vi.advanceTimersByTimeAsync(0);
+    expect(actor.getSnapshot().value).toBe('retryLater');
+    expect(items).toEqual([]);
+    actor.stop();
+  });
+
+  it('loses a message when synchronous fake timers fire the offer and the deadline in one task', async () => {
+    // The offer is armed first, so it fires first, but the take has not
+    // reported when the deadline fires in the same task.
+    const { queue, items } = createMessageQueue();
+    setTimeout(() => queue.offer('config changed'), 4_000);
+    const actor = createActor(createRetryMachine(queue)).start();
+    vi.advanceTimersByTime(4_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(actor.getSnapshot().value).toBe('retryLater');
+    expect(items).toEqual([]);
+    actor.stop();
+  });
+});
+
+describe('a deadline inside the logic with a child that keeps working after the take', () => {
+  it('loses a message when the deadline lands inside that work', async () => {
+    // The child takes the message at 3.5 seconds and saves it for a second.
+    // The deadline at 4 seconds aborts the child before it returns.
+    const { queue, items } = createMessageQueue();
+    const machine = createMachine({
+      initial: 'waiting',
+      states: {
+        waiting: {
+          invoke: {
+            src: createAsyncLogic({
+              timeout: 4_000,
+              run: async ({ signal }) => {
+                const value = await queue.take(signal);
+                await new Promise((resolvePromise) =>
+                  setTimeout(resolvePromise, 1_000)
+                );
+                return value;
+              }
+            }),
+            onDone: { target: 'retryNow' },
+            onError: ({ event }) => ({
+              target:
+                event.error instanceof TimeoutError ? 'retryLater' : 'failed'
+            })
+          }
+        },
+        retryNow: {},
+        retryLater: {},
+        failed: {}
+      }
+    });
+    const actor = createActor(machine).start();
+    await vi.advanceTimersByTimeAsync(3_500);
+    queue.offer('config changed');
+    await vi.advanceTimersByTimeAsync(1_500);
     expect(actor.getSnapshot().value).toBe('retryLater');
     expect(items).toEqual([]);
     actor.stop();

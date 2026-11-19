@@ -121,7 +121,7 @@ function recordSleeps(clock: Clock.Clock, label: string, order: string[]) {
   };
 }
 
-describe('racing a deadline inside the task', () => {
+describe('racing a deadline inside the task, compared with an `after` timer', () => {
   it('reaches retryLater and leaves a later signal in the queue', async () => {
     const result = await run(
       Effect.gen(function* () {
@@ -527,6 +527,10 @@ describe('a message that arrives before the machine handles the deadline', () =>
           // Fails here, not at the test timeout, if the child never arms it.
           expect(vi.getTimerCount()).toBeGreaterThanOrEqual(armedTimers);
           if (!messageFirst) offerAtDeadline();
+          // Moving Effect's test clock past the deadline leaves the timeout
+          // armed.
+          yield* TestClock.adjust('5 seconds');
+          expect(read()).toBe('waiting');
           if (messageFirst) {
             // Settling the take before the deadline fires lets the child
             // report it and clear the deadline.
