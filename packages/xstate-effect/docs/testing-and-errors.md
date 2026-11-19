@@ -61,6 +61,83 @@ console.log(result); // 'expired', with no 30-second wait
 
 XState's [path generation](../../../docs/model-based-testing.md) works on the machine itself. Execute generated paths against an actor from `createEffectActor`, or use `testPaths()` from `@xstate/test`.
 
+### Start the timer before advancing the clock
+
+`TestClock.adjust` does not wait for an actor that is still on its way to a delayed transition. It wakes the sleeps that are due and waits for the work each woken fiber schedules on the Effect scheduler. The same `adjust` also wakes a sleep that fiber starts next, but it can miss that sleep if the fiber first waits on host I/O or on a fiber the clock did not wake. It does not follow an actor through invoked work that yields or does I/O, and it does not wait out a long run of queued events or a slow step. In those cases the clock moves before the actor enters the state that owns the `after`. The timer then counts from the new time, and the test times out in a later `waitFor`.
+
+The queued-event and slow-step cases come from the actor loop, which [yields under continuous traffic so timers and other Effects can run](actors.md). It decides when to yield partly by elapsed real time, so a test that sends several events and advances the clock with no wait can pass locally and fail on a slower CI machine.
+
+Wait for the state that starts the timer, then advance the clock:
+
+<!-- example from examples/effect-workflows/src/clock-armed.ts -->
+
+```ts
+import { Effect } from 'effect';
+import { TestClock } from 'effect/testing';
+import {
+  createEffectActor,
+  createEffectLogic,
+  setupEffect,
+  waitFor
+} from '@xstate/effect';
+
+let attempts = 0;
+const connect = createEffectLogic(
+  // The yield stands in for real I/O. It is why the test below must wait for
+  // `backoff` before it advances the clock.
+  Effect.yieldNow.pipe(
+    Effect.andThen(
+      Effect.suspend(() => {
+        attempts++;
+        return attempts < 2
+          ? Effect.fail(new Error('Connection refused'))
+          : Effect.succeed('connected');
+      })
+    )
+  )
+);
+
+const connectionMachine = setupEffect({ actors: { connect } }).createMachine({
+  initial: 'idle',
+  states: {
+    idle: { on: { CONNECT: { target: 'connecting' } } },
+    connecting: {
+      invoke: {
+        src: 'connect',
+        onDone: { target: 'connected' },
+        onError: { target: 'backoff' }
+      }
+    },
+    backoff: { after: { 3000: { target: 'connecting' } } },
+    connected: {}
+  }
+});
+
+const test = Effect.gen(function* () {
+  const actor = yield* createEffectActor(connectionMachine);
+  actor.send({ type: 'CONNECT' });
+  // The first attempt is still running. Wait until its failure starts the
+  // backoff timer, then advance the clock.
+  yield* waitFor(actor, (s) => s.matches('backoff'));
+  yield* TestClock.adjust('3 seconds');
+  const snapshot = yield* waitFor(actor, (s) => s.matches('connected'));
+  return snapshot.value;
+});
+
+export const result = await Effect.runPromise(
+  test.pipe(Effect.scoped, Effect.provide(TestClock.layer()))
+);
+console.log(result); // 'connected', after one 3-second backoff
+```
+
+- The 30-second example above needs no wait. Its timer belongs to the initial state, so the actor starts it during startup, before `adjust` wakes anything.
+- `sendAndAwait` acknowledges the event you sent. It does not wait for an invoked actor's `onDone` or `onError`, so use `waitFor` when the timer's state follows one.
+- To check that nothing happens before a deadline, wait for the state that starts the timer, advance to just short of the delay, then assert. Without the wait, the assertion can pass because the timer has not started.
+- When an invoked actor runs between two timers, advance the clock once per timer and wait for the second timer's state in between.
+- When the invoked Effect itself sleeps, retries on a schedule or times out, it waits on the test clock too. A `waitFor` on the later state never returns until the clock moves. Advance the clock for the invoked work first, then wait for the timer's state, then advance the clock for the timer.
+- The same limit applies inside the invoked Effect. If it yields or does I/O before it sleeps, no actor state marks the moment the sleep starts. Have the test's version of that Effect signal the test just before it sleeps, for example by completing a `Deferred`, and await the signal before advancing the clock.
+- `waitFor` succeeds at once when the actor already matches. If the actor can already be in the timer's state when the test sends an event that leaves and re-enters it, acknowledge the event with `sendAndAwait` first, then wait for the state.
+
 ## Retry a task
 
 Use Effect's retry combinators inside `createEffectLogic` for transient failures within one task. This local publisher succeeds on its third attempt:
