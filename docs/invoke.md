@@ -258,6 +258,69 @@ authorizing: {
 
 Setting `timeout` without `onTimeout` throws when the machine is created in development builds. Use `createAsyncLogic({ timeout })` instead when the timeout belongs to the logic rather than to this particular invocation. See [timeouts](timeouts.md).
 
+## Racing an invocation against a timer
+
+`after`, a state `timeout` and an invoke `timeout` are events, and so is the child's completion. The machine handles whichever it receives first. If the timer's transition exits the invoking state, the child is stopped and a completion that arrives afterwards is ignored.
+
+Stopping a child does not undo work it already did. If the child took a job from a queue or spent a one-time token just before the timer fired, that work is done and its result never reaches `onDone`. A `fetch` that loses to a timer can be sent again. A queue item cannot be taken again.
+
+```ts
+waiting: {
+  // If `after` exits `waiting` first, a signal the child already took is lost.
+  invoke: { src: 'takeSignal', onDone: { target: 'retryNow' } },
+  after: { 4_000: { target: 'retryLater' } }
+}
+```
+
+The same applies to any event that exits the invoking state, such as a `cancel` sent while the child is finishing.
+
+When the result must not be lost, let the child own the deadline. Async logic with its own `timeout` aborts its `signal` when the time is up, and only then errors with a `TimeoutError`. One actor decides between the two outcomes, so it cannot take a signal and report a deadline:
+
+<!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
+```ts
+import { createAsyncLogic, setup, TimeoutError } from 'xstate';
+
+/** Your own queue. `take` must stop waiting when its signal aborts. */
+export interface SignalQueue {
+  take(signal: AbortSignal): Promise<string>;
+}
+
+export function createRetryMachine(signals: SignalQueue) {
+  // The logic owns the deadline. After four seconds it aborts `signal`,
+  // which withdraws the pending take, and then errors with a TimeoutError.
+  const takeSignal = createAsyncLogic({
+    timeout: 4_000,
+    run: ({ signal }) => signals.take(signal)
+  });
+
+  return setup({ actors: { takeSignal } }).createMachine({
+    initial: 'waiting',
+    states: {
+      waiting: {
+        invoke: {
+          src: 'takeSignal',
+          onDone: { target: 'retryNow' },
+          onError: ({ event }) => ({
+            target:
+              event.error instanceof TimeoutError ? 'retryLater' : 'failed'
+          })
+        }
+      },
+      retryNow: {},
+      retryLater: {},
+      failed: {}
+    }
+  });
+}
+```
+
+Two rules keep this safe:
+
+- `take` must stop waiting when the signal aborts. Otherwise a stopped actor stays subscribed and takes the next item.
+- The step that consumes must be the last `await` in `run`. Work after it can still be cut off by the deadline.
+
+The size of the gap depends on the runtime. `createActor` handles a timer in the task that fires it, so a timer cannot land between a child's last `await` and its `onDone`. An event sent in the same task as the child's input can, and so can a timer when the child keeps working after it consumes. Under `createEffectActor` from `@xstate/effect` the machine runs on its own fiber and the gap is at least one event-loop turn. That package's actor logic guide shows the same pattern with `Effect.raceFirst`.
+
 ## Referencing the child
 
 Invoked children appear on `snapshot.children` under their `id`, and transition functions receive them as `children`:

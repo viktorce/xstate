@@ -88,6 +88,74 @@ Use Effect's retry and timeout combinators inside the task.
 
 </details>
 
+### Racing a deadline
+
+A state timer and an invoked task are separate fibers that report to the machine through one mailbox. An `after`, a state `timeout` or an invoke `timeout` can reach the machine before the task's result, even when the task finished first. The machine leaves the state and the result has no transition left to take. The task is interrupted about one event-loop turn after the timer fires, so it can also take an item from a `Queue` in between.
+
+When the result must not be lost, race the deadline inside the task. `Effect.raceFirst` interrupts the loser, and an interrupted `Queue.take` leaves the item in the queue:
+
+<!-- example from examples/effect-workflows/src/deadline.ts -->
+
+```ts
+import { Context, Effect, Queue } from 'effect';
+import {
+  createEffectActor,
+  createEffectLogic,
+  setupEffect,
+  waitFor
+} from '@xstate/effect';
+
+export class Signals extends Context.Service<Signals, Queue.Queue<string>>()(
+  '@app/Signals'
+) {}
+
+// One Effect owns both outcomes. When the deadline wins, the take is
+// interrupted before it removes anything from the queue.
+const nextSignal = createEffectLogic(
+  Signals.use((signals) =>
+    Effect.raceFirst(
+      Queue.take(signals).pipe(
+        Effect.map((signal) => ({ kind: 'signal' as const, signal }))
+      ),
+      Effect.sleep('4 seconds').pipe(Effect.as({ kind: 'deadline' as const }))
+    )
+  )
+);
+
+const retryMachine = setupEffect({ actors: { nextSignal } }).createMachine({
+  initial: 'waiting',
+  states: {
+    waiting: {
+      invoke: {
+        src: 'nextSignal',
+        onDone: ({ event }) => ({
+          target: event.output.kind === 'signal' ? 'retryNow' : 'retryLater'
+        })
+      }
+    },
+    retryNow: { type: 'final' },
+    retryLater: { type: 'final' }
+  }
+});
+
+const program = Effect.gen(function* () {
+  const signals = yield* Queue.unbounded<string>();
+  const actor = yield* createEffectActor(retryMachine).pipe(
+    Effect.provideService(Signals, signals)
+  );
+  yield* Queue.offer(signals, 'config changed');
+  const snapshot = yield* waitFor(actor, (s) => s.status === 'done');
+  return snapshot.value;
+});
+
+export const result = await Effect.runPromise(Effect.scoped(program));
+console.log(result); // 'retryNow'
+```
+
+- `onDone` receives either outcome, so a signal that was taken always reaches the machine.
+- `Effect.timeoutOption` gives the same guarantee and returns `Option.none()` at the deadline.
+- Keep `after` and `timeout` for work that is safe to repeat or abandon.
+
 ## `createEffectStreamLogic`
 
 Use `createEffectStreamLogic` when consumers need the latest value. For example, upload progress becomes the actor's snapshot context:

@@ -69,6 +69,8 @@ uploading: {
 
 `onTimeout` is required when an invocation has a `timeout`; omitting it throws at machine creation in development builds. The timer is canceled when the invoked actor completes, even if the state stays active. Unlike state timeouts, invocation timeouts are not resolved against named delays.
 
+An invocation `timeout` is a timer on the invoking state, not a deadline inside the child. `onTimeout` and `onDone` are separate events, and the machine takes the first one it receives. If `onTimeout` exits the state, a completion that arrives afterwards is ignored, even when the child had already finished its work. When that result must not be lost, put the deadline inside the actor with an [async logic timeout](#async-logic-timeouts). See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
+
 ## Async logic timeouts
 
 `createAsyncLogic(...)` accepts a `timeout`. When it elapses, the run's `AbortSignal` is aborted and the actor errors with a `TimeoutError`.
