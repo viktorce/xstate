@@ -90,9 +90,11 @@ Use Effect's retry and timeout combinators inside the task.
 
 ### Racing a deadline
 
-A state timer and an invoked task are separate fibers that report to the machine through one mailbox. An `after`, a state `timeout` or an invoke `timeout` can reach the machine before the task's result, even when the task finished first. The machine leaves the state and the result has no transition left to take. The task is interrupted about one event-loop turn after the timer fires, so it can also take an item from a `Queue` in between.
+A state timer and an invoked task are separate fibers that report to the machine through one mailbox, and the machine handles events in the order they arrive. An `after`, a state `timeout` or an invoke `timeout` is one event and the task's result is another. A task that finished before the timer fired wins.
 
-When the result must not be lost, race the deadline inside the task. `Effect.raceFirst` interrupts the loser, and an interrupted `Queue.take` leaves the item in the queue:
+The loss happens when the timer's event is already in the mailbox and the task then takes an item from a `Queue`. That can happen even if the item was offered before the timer fired, because Effect resumes a waiting `Queue.take` on a later scheduler step. The machine handles the timer on a later step of its own fiber, and the task keeps running until then. How long that takes depends on the Effect scheduler. If the timer's transition exits the invoking state, the machine interrupts the task and the item it took is lost. A targetless timer handler leaves the task running. Nothing reports the drop. A late result finds no transition, and it is not a dead letter.
+
+When the result must not be lost to a timer, race the deadline inside the task. `Effect.raceFirst` interrupts the loser, and an interrupted `Queue.take` leaves the item in the queue:
 
 <!-- example from examples/effect-workflows/src/deadline.ts -->
 
@@ -152,9 +154,14 @@ export const result = await Effect.runPromise(Effect.scoped(program));
 console.log(result); // 'retryNow'
 ```
 
-- `onDone` receives either outcome, so a signal that was taken always reaches the machine.
-- `Effect.timeoutOption` gives the same guarantee and returns `Option.none()` at the deadline.
+- `onDone` receives either outcome, so the race removes the competing timer. Another transition out of `waiting`, or stopping the actor, can still interrupt the task after it took an item and discard that item.
+- The consuming step must be safe to interrupt. `Queue.take` is, in effect 4.0.6. Other sources may not be.
+- Nothing asynchronous may follow the consuming step inside the raced branch, only synchronous mapping such as `Effect.map`. Avoid a branch shaped like `Queue.take(q).pipe(Effect.flatMap(save))`, which can lose the deadline race after it took the item.
+- `Effect.timeoutOption` works the same way and returns `Option.none()` at the deadline.
+- The deadline restarts in full when the actor is restored, because a running Effect task starts again from the beginning. An `after` timer keeps its original deadline. See [persisting and restoring](actors.md#persisting-and-restoring).
 - Keep `after` and `timeout` for work that is safe to repeat or abandon.
+
+The core guide covers the same race for `createAsyncLogic` in [racing an invocation against a timer](../../../docs/invoke.md#racing-an-invocation-against-a-timer).
 
 ## `createEffectStreamLogic`
 

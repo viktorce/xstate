@@ -62,7 +62,7 @@ Use delayed transitions for behavior tied to the current state. Use delayed even
 
 `after` schedules a transition at a point in time after a state is entered. A state [`timeout`](timeouts.md) expresses a deadline for the work the state represents and takes its `onTimeout` transition when it expires. Both timers can be used on the same state, and both are canceled when the state is exited. Invocations and async logic accept a `timeout` as well; an invoke `timeout` must be a number of milliseconds, while async logic also accepts duration strings.
 
-`after` does not wait for an invoked actor on the same state. If the timer's transition exits the state, the actor is stopped and its result is dropped, including work it finished just before the timer fired. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
+`after` does not wait for an invoked actor on the same state. If the timer's transition exits the state, the actor is stopped and a result it has not reported yet is dropped. That includes side effects the actor completed but had not reported when the timer fired. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
 
 Common examples include:
 

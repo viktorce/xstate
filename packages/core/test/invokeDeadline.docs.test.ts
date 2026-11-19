@@ -1,13 +1,18 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { createActor, createAsyncLogic, createMachine } from '../src/index.ts';
+import {
+  createActor,
+  createAsyncLogic,
+  createMachine,
+  SimulatedClock
+} from '../src/index.ts';
 import {
   createRetryMachine,
   type SignalQueue
 } from './fixtures/invoke-deadline/take-or-deadline.ts';
 
 /** A queue whose pending take is withdrawn when its signal aborts. */
-function createSignalQueue() {
+function createSignalQueue(failure?: Error) {
   const items: string[] = [];
   let waiters: Array<(value: string) => void> = [];
   const queue: SignalQueue & { offer(value: string): void } = {
@@ -17,6 +22,7 @@ function createSignalQueue() {
       else items.push(value);
     },
     take(signal) {
+      if (failure) return Promise.reject(failure);
       if (items.length) return Promise.resolve(items.shift()!);
       return new Promise((resolvePromise, reject) => {
         const waiter = (value: string) => resolvePromise(value);
@@ -122,4 +128,86 @@ it('drops a result that settles in the task that exits the invoking state', asyn
   expect(actor.getSnapshot().value).toBe('retryLater');
   expect(items).toEqual([]);
   actor.stop();
+});
+
+it('reaches failed when take rejects with an error other than a timeout', async () => {
+  const { queue } = createSignalQueue(new Error('queue closed'));
+  const actor = createActor(createRetryMachine(queue)).start();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(actor.getSnapshot().value).toBe('failed');
+  actor.stop();
+});
+
+it('loses a signal when a simulated clock advances in the task that offers it', async () => {
+  // The take settles but has not reported when the clock fires the deadline.
+  const { queue, items } = createSignalQueue();
+  const clock = new SimulatedClock();
+  const actor = createActor(createRetryMachine(queue), { clock }).start();
+  clock.increment(3_999);
+  queue.offer('config changed');
+  clock.increment(1);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(actor.getSnapshot().value).toBe('retryLater');
+  expect(items).toEqual([]);
+  actor.stop();
+});
+
+describe('a timer on the invoking state', () => {
+  // The child keeps awaiting after it took the signal, so the timer
+  // exits the state before the child reports.
+  const consumeThenSave = (queue: SignalQueue) =>
+    createAsyncLogic({
+      run: async ({ signal }) => {
+        const value = await queue.take(signal);
+        await new Promise((resolvePromise) =>
+          setTimeout(resolvePromise, 1_000)
+        );
+        return value;
+      }
+    });
+
+  it.each([
+    [
+      'after',
+      (queue: SignalQueue) => ({
+        invoke: { src: consumeThenSave(queue), onDone: { target: 'retryNow' } },
+        after: { 4_000: { target: 'retryLater' } }
+      })
+    ],
+    [
+      'an invoke timeout',
+      (queue: SignalQueue) => ({
+        invoke: {
+          src: consumeThenSave(queue),
+          timeout: 4_000,
+          onDone: { target: 'retryNow' },
+          onTimeout: { target: 'retryLater' }
+        }
+      })
+    ],
+    [
+      'a state timeout',
+      (queue: SignalQueue) => ({
+        invoke: { src: consumeThenSave(queue), onDone: { target: 'retryNow' } },
+        timeout: 4_000,
+        onTimeout: { target: 'retryLater' }
+      })
+    ]
+  ] as const)(
+    'drops a signal the child took when %s exits first',
+    async (_description, waiting) => {
+      const { queue, items } = createSignalQueue();
+      const machine = createMachine({
+        initial: 'waiting',
+        states: { waiting: waiting(queue), retryNow: {}, retryLater: {} }
+      });
+      const actor = createActor(machine).start();
+      await vi.advanceTimersByTimeAsync(3_500);
+      queue.offer('config changed');
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(actor.getSnapshot().value).toBe('retryLater');
+      expect(items).toEqual([]);
+      actor.stop();
+    }
+  );
 });
