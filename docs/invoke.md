@@ -272,12 +272,11 @@ The loss needs a gap between the child consuming and the machine handling the ch
 - The take removes the item in one task and settles its promise in a later one, such as a request to a queue server.
 - An event that exits the state is sent in the same task that settles the take. A [simulated clock](testing.md#control-time) or synchronous fake timers advanced in that task count too.
 
-A host that queues events, such as `createEffectActor` from `@xstate/effect`, handles a timer later than it fires. A child can take an item in between, and its completion then waits behind the timer. How long that takes depends on the Effect scheduler.
+A host that queues events, such as `createEffectActor` from `@xstate/effect`, handles a timer later than it fires. A child can take an item in between, and its completion then waits behind the timer. How long the machine takes to handle the timer depends on the Effect scheduler.
 
 ```ts
 waiting: {
-  // Loses a message the child took if the child keeps working after the
-  // take, or under a host that queues events.
+  // Loses a message the child took in any of the cases listed above.
   invoke: { src: 'takeMessage', onDone: { target: 'retryNow' } },
   after: { 4_000: { target: 'retryLater' } }
 }
@@ -291,11 +290,11 @@ A child that consumes from a queue keeps its result when it follows three rules:
 - The step that consumes must be the last `await` in `run`. The timer can still cut off work after it.
 - `take` must remove the item in the same task that settles its promise. A take that removes the item in one task and settles in a later one, such as a network request, can still lose the item. The server has already removed the item, and the machine handles the timer first. Such a take needs the reservation step described below.
 
-On `createActor` with the default clock, a child that follows these rules does not lose a result to `after`, a state `timeout` or an invoke `timeout`. If the child finished first, its completion wins. If the timer wins, stopping the child aborts the abort signal passed to `run`, which withdraws the take and leaves the item in the queue.
+On `createActor` with the default clock and real timers, a child that follows these rules does not lose a result to `after`, a state `timeout` or an invoke `timeout`. If the child finished first, its completion wins. If the timer wins, stopping the child aborts the abort signal passed to `run`, which withdraws the take and leaves the item in the queue.
 
 ### A deadline inside the logic
 
-Async logic with its own `timeout` aborts the abort signal passed to `run` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, so the result does not depend on how the host delivers the timer and the completion. This holds under `createEffectActor` as well. It does not remove the ways the loss happens on `createActor`. Those still need the rules above or the reservation step. The example assumes an in-memory queue, where `take` removes the item and settles its promise in the same task:
+Async logic with its own `timeout` aborts the abort signal passed to `run` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, so the result does not depend on how the host delivers the timer and the completion. This holds under `createEffectActor` as well. There the timeout runs on the host's `setTimeout`, not on Effect's `Clock`, so `TestClock` does not advance it. In an Effect task, race the deadline inside the task instead, as the [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) section shows. On `createActor`, the first two ways listed in [when the loss happens](#when-the-loss-happens) still need the rules above. The third way needs the reservation step. With a simulated clock or fake timers, you can also advance the clock in a separate task from the one that settles the take. The example assumes an in-memory queue, where `take` removes the item and settles its promise in the same task:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
 ```ts

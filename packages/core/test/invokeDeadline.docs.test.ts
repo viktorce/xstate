@@ -107,6 +107,19 @@ describe('the documented example', () => {
     }
   );
 
+  it('reaches retryNow when a simulated clock advances in a later task than the offer', async () => {
+    const { queue, items } = createMessageQueue();
+    const clock = new SimulatedClock();
+    const actor = createActor(createRetryMachine(queue), { clock }).start();
+    clock.increment(3_999);
+    queue.offer('config changed');
+    await vi.advanceTimersByTimeAsync(0);
+    clock.increment(1);
+    expect(actor.getSnapshot().value).toBe('retryNow');
+    expect(items).toEqual([]);
+    actor.stop();
+  });
+
   it('reaches failed when take rejects with an error other than a timeout', async () => {
     const { queue } = createMessageQueue(new Error('queue closed'));
     const actor = createActor(createRetryMachine(queue)).start();
@@ -254,90 +267,98 @@ describe('ways the documented example still loses a message', () => {
   });
 });
 
-it('drops a result that settles in the task that exits the invoking state', async () => {
-  // The behavior the docs warn about: the completion and the exiting event
-  // are two events, and the one handled first wins.
-  const { queue, items } = createMessageQueue();
-  const machine = createMachine({
-    initial: 'waiting',
-    states: {
-      waiting: {
-        invoke: {
-          src: createAsyncLogic({ run: ({ signal }) => queue.take(signal) }),
-          onDone: { target: 'retryNow' }
+describe('ways a machine without a deadline in the logic loses a message', () => {
+  it('drops a result that settles in the task that exits the invoking state', async () => {
+    // The behavior the docs warn about: the completion and the exiting event
+    // are two events, and the one handled first wins.
+    const { queue, items } = createMessageQueue();
+    const machine = createMachine({
+      initial: 'waiting',
+      states: {
+        waiting: {
+          invoke: {
+            src: createAsyncLogic({ run: ({ signal }) => queue.take(signal) }),
+            onDone: { target: 'retryNow' }
+          },
+          on: { giveUp: { target: 'retryLater' } }
         },
-        on: { giveUp: { target: 'retryLater' } }
-      },
-      retryNow: {},
-      retryLater: {}
-    }
-  });
-  const actor = createActor(machine).start();
-  await vi.advanceTimersByTimeAsync(1);
-  queue.offer('config changed');
-  actor.send({ type: 'giveUp' });
-  await vi.advanceTimersByTimeAsync(1);
-  expect(actor.getSnapshot().value).toBe('retryLater');
-  expect(items).toEqual([]);
-  actor.stop();
-});
-
-describe('a timer on the invoking state', () => {
-  // The child keeps awaiting after it took the message, so the timer
-  // exits the state before the child reports.
-  const consumeThenSave = (queue: MessageQueue) =>
-    createAsyncLogic({
-      run: async ({ signal }) => {
-        const value = await queue.take(signal);
-        await new Promise((resolvePromise) =>
-          setTimeout(resolvePromise, 1_000)
-        );
-        return value;
+        retryNow: {},
+        retryLater: {}
       }
     });
+    const actor = createActor(machine).start();
+    await vi.advanceTimersByTimeAsync(1);
+    queue.offer('config changed');
+    actor.send({ type: 'giveUp' });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(actor.getSnapshot().value).toBe('retryLater');
+    expect(items).toEqual([]);
+    actor.stop();
+  });
 
-  it.each([
-    [
-      'after',
-      (queue: MessageQueue) => ({
-        invoke: { src: consumeThenSave(queue), onDone: { target: 'retryNow' } },
-        after: { 4_000: { target: 'retryLater' } }
-      })
-    ],
-    [
-      'an invoke timeout',
-      (queue: MessageQueue) => ({
-        invoke: {
-          src: consumeThenSave(queue),
-          timeout: 4_000,
-          onDone: { target: 'retryNow' },
-          onTimeout: { target: 'retryLater' }
+  describe('a child that keeps working after the take, racing a timer on the invoking state', () => {
+    // The child keeps awaiting after it took the message, so the timer
+    // exits the state before the child reports.
+    const consumeThenSave = (queue: MessageQueue) =>
+      createAsyncLogic({
+        run: async ({ signal }) => {
+          const value = await queue.take(signal);
+          await new Promise((resolvePromise) =>
+            setTimeout(resolvePromise, 1_000)
+          );
+          return value;
         }
-      })
-    ],
-    [
-      'a state timeout',
-      (queue: MessageQueue) => ({
-        invoke: { src: consumeThenSave(queue), onDone: { target: 'retryNow' } },
-        timeout: 4_000,
-        onTimeout: { target: 'retryLater' }
-      })
-    ]
-  ] as const)(
-    'drops a message the child took when %s exits first',
-    async (_description, waiting) => {
-      const { queue, items } = createMessageQueue();
-      const machine = createMachine({
-        initial: 'waiting',
-        states: { waiting: waiting(queue), retryNow: {}, retryLater: {} }
       });
-      const actor = createActor(machine).start();
-      await vi.advanceTimersByTimeAsync(3_500);
-      queue.offer('config changed');
-      await vi.advanceTimersByTimeAsync(1_500);
-      expect(actor.getSnapshot().value).toBe('retryLater');
-      expect(items).toEqual([]);
-      actor.stop();
-    }
-  );
+
+    it.each([
+      [
+        'after',
+        (queue: MessageQueue) => ({
+          invoke: {
+            src: consumeThenSave(queue),
+            onDone: { target: 'retryNow' }
+          },
+          after: { 4_000: { target: 'retryLater' } }
+        })
+      ],
+      [
+        'an invoke timeout',
+        (queue: MessageQueue) => ({
+          invoke: {
+            src: consumeThenSave(queue),
+            timeout: 4_000,
+            onDone: { target: 'retryNow' },
+            onTimeout: { target: 'retryLater' }
+          }
+        })
+      ],
+      [
+        'a state timeout',
+        (queue: MessageQueue) => ({
+          invoke: {
+            src: consumeThenSave(queue),
+            onDone: { target: 'retryNow' }
+          },
+          timeout: 4_000,
+          onTimeout: { target: 'retryLater' }
+        })
+      ]
+    ] as const)(
+      'drops a message the child took when %s exits first',
+      async (_description, waiting) => {
+        const { queue, items } = createMessageQueue();
+        const machine = createMachine({
+          initial: 'waiting',
+          states: { waiting: waiting(queue), retryNow: {}, retryLater: {} }
+        });
+        const actor = createActor(machine).start();
+        await vi.advanceTimersByTimeAsync(3_500);
+        queue.offer('config changed');
+        await vi.advanceTimersByTimeAsync(1_500);
+        expect(actor.getSnapshot().value).toBe('retryLater');
+        expect(items).toEqual([]);
+        actor.stop();
+      }
+    );
+  });
 });

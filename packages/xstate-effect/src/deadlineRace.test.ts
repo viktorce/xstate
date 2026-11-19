@@ -75,6 +75,20 @@ const retryMachine = createRetryMachine(
   )
 );
 
+const timeoutMachine = createRetryMachine(
+  Signals.use((signals) =>
+    Queue.take(signals).pipe(
+      Effect.timeoutOption('4 seconds'),
+      Effect.map(
+        Option.match({
+          onNone: () => ({ kind: 'deadline' as const }),
+          onSome: (signal) => ({ kind: 'signal' as const, signal })
+        })
+      )
+    )
+  )
+);
+
 const afterMachine = createAfterMachine(
   Signals.use((signals) => Queue.take(signals))
 );
@@ -127,19 +141,6 @@ describe('racing a deadline inside the task', () => {
   });
 
   it('with Effect.timeoutOption, reaches retryLater and leaves a later signal in the queue', async () => {
-    const timeoutMachine = createRetryMachine(
-      Signals.use((signals) =>
-        Queue.take(signals).pipe(
-          Effect.timeoutOption('4 seconds'),
-          Effect.map(
-            Option.match({
-              onNone: () => ({ kind: 'deadline' as const }),
-              onSome: (signal) => ({ kind: 'signal' as const, signal })
-            })
-          )
-        )
-      )
-    );
     const result = await run(
       Effect.gen(function* () {
         const signals = yield* Signals;
@@ -157,23 +158,29 @@ describe('racing a deadline inside the task', () => {
     expect(result).toEqual({ value: 'retryLater', size: 1 });
   });
 
-  it('reaches retryNow and empties the queue when the signal comes first', async () => {
-    const result = await run(
-      Effect.gen(function* () {
-        const signals = yield* Signals;
-        const deadline = recordSleeps(yield* Clock.Clock, 'deadline', []);
-        const actor = yield* createEffectActor(retryMachine).pipe(
-          Effect.provideService(Clock.Clock, deadline.clock)
-        );
-        yield* deadline.registered;
-        yield* TestClock.adjust('3 seconds');
-        yield* Queue.offer(signals, 'config changed');
-        const snapshot = yield* waitFor(actor, (s) => s.status === 'done');
-        return { value: snapshot.value, size: yield* Queue.size(signals) };
-      })
-    );
-    expect(result).toEqual({ value: 'retryNow', size: 0 });
-  });
+  it.each([
+    ['Effect.raceFirst', retryMachine],
+    ['Effect.timeoutOption', timeoutMachine]
+  ] as const)(
+    'with %s, reaches retryNow and empties the queue when the signal comes first',
+    async (_description, machine) => {
+      const result = await run(
+        Effect.gen(function* () {
+          const signals = yield* Signals;
+          const deadline = recordSleeps(yield* Clock.Clock, 'deadline', []);
+          const actor = yield* createEffectActor(machine).pipe(
+            Effect.provideService(Clock.Clock, deadline.clock)
+          );
+          yield* deadline.registered;
+          yield* TestClock.adjust('3 seconds');
+          yield* Queue.offer(signals, 'config changed');
+          const snapshot = yield* waitFor(actor, (s) => s.status === 'done');
+          return { value: snapshot.value, size: yield* Queue.size(signals) };
+        })
+      );
+      expect(result).toEqual({ value: 'retryNow', size: 0 });
+    }
+  );
 
   it.each([
     [
@@ -513,9 +520,12 @@ describe('a message that arrives before the machine handles the deadline', () =>
           read = () => actor.getSnapshot().value;
           // The child starts on the actor's fiber. Wait until it has armed
           // its deadline, so the two timers fire in the order armed.
-          while (vi.getTimerCount() < (messageFirst ? 2 : 1)) {
+          const armedTimers = messageFirst ? 2 : 1;
+          for (let i = 0; i < 100 && vi.getTimerCount() < armedTimers; i++) {
             yield* Effect.yieldNow;
           }
+          // Fails here, not at the test timeout, if the child never arms it.
+          expect(vi.getTimerCount()).toBeGreaterThanOrEqual(armedTimers);
           if (!messageFirst) offerAtDeadline();
           if (messageFirst) {
             // Settling the take before the deadline fires lets the child
