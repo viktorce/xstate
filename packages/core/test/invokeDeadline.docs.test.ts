@@ -1,12 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+// Imported from 'xstate' like the fixture, so both resolve to the same
+// module and types whether the package is linked to source or built.
 import {
   createActor,
   createAsyncLogic,
   createMachine,
   SimulatedClock,
   TimeoutError
-} from '../src/index.ts';
+} from 'xstate';
 import {
   createRetryMachine,
   type MessageQueue
