@@ -161,7 +161,7 @@ console.log(result); // 'retryNow'
 ```
 
 - `onDone` receives either outcome, so the race removes the competing timer. Another transition out of `waiting`, or stopping the actor, can still interrupt the task after it took an item and discard that item.
-- The consuming step must be safe to interrupt. `Queue.take` is in effect 4.0.6, the version this package is tested against, and a test guards that behavior. Other sources may not be.
+- The consuming step must be safe to interrupt. `Queue.take` is safe to interrupt in effect 4.0.6, the version this package is tested against, and a test guards that behavior. Other sources may not be.
 - Nothing asynchronous may follow the consuming step inside the raced branch, only synchronous mapping such as `Effect.map`. Avoid a branch shaped like `Queue.take(q).pipe(Effect.flatMap(save))`, which can lose the deadline race after it took the item.
 - `Effect.timeoutOption` works the same way and returns `Option.none()` at the deadline.
 - The deadline restarts in full when the actor is restored, because a running Effect task starts again from the beginning. An `after` timer keeps its original deadline. See [persisting and restoring](actors.md#persisting-and-restoring).
