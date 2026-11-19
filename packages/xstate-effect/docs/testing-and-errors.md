@@ -63,9 +63,9 @@ XState's [path generation](../../../docs/model-based-testing.md) works on the ma
 
 ### Start the timer before advancing the clock
 
-`TestClock.adjust` does not wait for an actor that is still on its way to a delayed transition. It wakes the sleeps that are due, including sleeps that plain Effect fibers start while it runs. It does not follow an actor through invoked work that yields or does I/O, and it does not wait out a long run of queued events or a slow step. In those cases the clock moves before the actor enters the state that owns the `after`. The timer then counts from the new time, and the test times out in a later `waitFor`.
+`TestClock.adjust` does not wait for an actor that is still on its way to a delayed transition. It wakes the sleeps that are due and waits for the work each woken fiber schedules, so a sleep that fiber starts next is covered too. It does not follow an actor through invoked work that yields or does I/O, and it does not wait out a long run of queued events or a slow step. In those cases the clock moves before the actor enters the state that owns the `after`. The timer then counts from the new time, and the test times out in a later `waitFor`.
 
-The last two cases come from the actor loop, which [yields under continuous traffic so timers and other Effects can run](actors.md). It decides when to yield partly by elapsed real time, so a test that sends several events and advances the clock with no wait can pass locally and fail on a slower CI machine.
+The queued-event and slow-step cases come from the actor loop, which [yields under continuous traffic so timers and other Effects can run](actors.md). It decides when to yield partly by elapsed real time, so a test that sends several events and advances the clock with no wait can pass locally and fail on a slower CI machine.
 
 Wait for the state that starts the timer, then advance the clock:
 

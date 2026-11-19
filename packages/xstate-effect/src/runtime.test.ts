@@ -711,7 +711,16 @@ describe('@xstate/effect runtime', () => {
 
   it('two timers around an invoked Effect fire with one clock advance each', async () => {
     const machine = setupEffect({
-      actors: { work: createEffectLogic(Effect.as(Effect.yieldNow, 'ok')) }
+      actors: {
+        work: createEffectLogic(
+          Effect.gen(function* () {
+            for (let turn = 0; turn < 5; turn++) {
+              yield* Effect.yieldNow;
+            }
+            return 'ok';
+          })
+        )
+      }
     }).createMachine({
       initial: 'first',
       states: {
@@ -762,7 +771,7 @@ describe('@xstate/effect runtime', () => {
           const actor = yield* createEffectActor(machine);
           actor.send({ type: 'CONNECT' });
 
-          // The invoked sleep needs its own clock advance.
+          // Advance for the invoked sleep first, so the backoff deadline can be pinned.
           yield* waitFor(actor, (state) => state.matches('connecting'));
           yield* TestClock.adjust('1 second');
           yield* waitFor(actor, (state) => state.matches('backoff'));
