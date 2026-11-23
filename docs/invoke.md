@@ -260,48 +260,53 @@ Setting `timeout` without `onTimeout` throws when the machine is created in deve
 
 ## Racing an invocation against a timer
 
-An `after`, a state `timeout` or an invoke `timeout` is one event, and the child's completion is another. The machine handles each event when it arrives. A transition that exits the invoking state is what stops the child. A targetless `onDone` handles the completion and stays in the state, so an `after` or a state `timeout` can still fire afterwards and exit. An invoke `timeout` is different, because the machine cancels it when the invoked actor completes.
+When a timer's transition exits the invoking state before the child reports, the machine stops the child and the result never reaches `onDone`. An `after`, a state `timeout` and an invoke `timeout` each arrive as one event, and the child's completion is another. Stopping a child does not undo work it already did. If the child took a job from a queue or spent a one-time token, that work is done. Nothing reports the drop as an error. An idempotent read that loses to a timer can usually be sent again. Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before retrying a write. A queue that does not redeliver never hands out a lost item again.
 
-When a timer's transition exits the state before the child reports, the machine stops the child and the result never reaches `onDone`. Stopping a child does not undo work it already did. If the child took a job from a queue or spent a one-time token, that work is done. Nothing reports the drop as an error. An idempotent read that loses to a timer can usually be sent again. A write may already have taken effect, so read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before retrying one. A queue that does not redeliver never hands out a lost item again.
-
-Pick the remedy by host and queue. On `createActor` with the default clock and real timers, a child that follows the [rules for the child](#rules-for-the-child) keeps its result, and a plain `after` is fine. On a host that queues events, such as `createEffectActor`, also put the [deadline inside the logic](#a-deadline-inside-the-logic). For a queue reached over a network, or when another event can exit the state, [reserve, then commit](#reserve-then-commit).
+Only a transition that exits the invoking state stops the child. A targetless `onDone` handles the completion and stays in the state, so an `after` or a state `timeout` can still fire afterwards and exit without losing the result. The machine cancels an invoke `timeout` when the invoked actor completes.
 
 ### When the loss happens
 
-In this section a task is one callback, such as a timer firing, plus the promise callbacks that run right after it. `createActor` with the default clock delivers a timer in the task that fires it, and relays a child's completion in the task that settles it. A child that finished before the timer fired wins. The loss then needs one of these cases:
+```ts
+waiting: {
+  // Loses a message the child took in the cases below.
+  invoke: {
+    src: 'takeMessage',
+    onDone: ({ event }) => ({
+      target: 'retryNow',
+      context: { message: event.output }
+    })
+  },
+  after: { 4_000: { target: 'retryLater' } }
+}
+```
+
+In this section a task is one event-loop callback, such as a timer firing, plus the promise callbacks that run right after it. `createActor` with the default clock delivers a timer in the task that fires it, and relays a child's completion in the task that settles it. A child that finished before the timer fired wins. The loss then needs one of these cases:
 
 - Work after the take. The child keeps working after it consumed, such as saving the item before it returns.
 - A take that settles later. The take removes the item in one task and settles its promise in a later one, such as a request to a queue server.
 - An exit in the same task. An event that exits the state arrives in the task that settles the take. Advancing a [simulated clock](testing.md#control-time) or synchronous fake timers in that task counts too.
 
-A host that queues events, such as `createEffectActor` from `@xstate/effect`, handles a timer later than the timer fires. A child can take an item in between, and its completion then waits behind the timer.
+A host that queues events, such as `createEffectActor` from `@xstate/effect`, handles an event later than it was sent. A child can take an item in between, and its completion then waits behind the timer.
 
-```ts
-waiting: {
-  // The message is only a wake-up signal, so onDone ignores it.
-  // Loses a message the child took in the cases above.
-  invoke: { src: 'takeMessage', onDone: { target: 'retryNow' } },
-  after: { 4_000: { target: 'retryLater' } }
-}
-```
+Pick the remedy by host and queue. On `createActor` with the default clock and real timers, a child that follows the [rules for the child](#rules-for-the-child) keeps its result, and a plain `after` is fine. On a host that queues events, a [deadline inside the logic](#a-deadline-inside-the-logic) replaces the machine timer. For a queue reached over a network, or an event that can exit the state in the task that settles the take, [reserve, then commit](#reserve-then-commit). On a host that queues events this includes any other event that exits the state.
 
 ### Rules for the child
 
-A child that consumes from a queue keeps its result against a timer when it follows three rules:
+In these rules, `take` is your queue's consuming call and `run` is the function passed to `createAsyncLogic`, which receives an abort signal as `signal`. A child that consumes from a queue follows three rules:
 
-- `take` must stop waiting when the abort signal aborts. Otherwise a stopped actor stays subscribed and takes the next item.
-- After the take settles, `run` does only synchronous work and returns the value itself, not a promise that is still pending. This rule prevents work after the take.
+- `take` must stop waiting when `signal` aborts. Otherwise a stopped actor stays subscribed and takes the next item.
+- Once the take settles, `run` resolves with its value without awaiting anything else. Synchronous mapping is fine. Saving the item or calling another async API first is not.
 - `take` must remove the item in the same task that settles its promise. A take that settles later needs [reserve, then commit](#reserve-then-commit).
 
-On `createActor` with the default clock and real timers, a child that follows these rules does not lose a result to `after`, a state `timeout` or an invoke `timeout`. If the child finished first, its completion wins. If the timer wins, the machine stops the child, which aborts the abort signal passed to `run`. The take withdraws, and the item stays in the queue.
+On `createActor` with the default clock and real timers, if a child that follows these rules finished first, its completion wins. If the timer wins, the machine stops the child, which aborts `signal`. The take withdraws, and the item stays in the queue.
 
-The rules do not cover an exit in the same task. With a simulated clock or synchronous fake timers, advance the clock in a later task than the one that settles the take. For any other event that exits the state, reserve, then commit.
+The rules do not cover an exit in the same task. With a simulated clock or synchronous fake timers, advance the clock in a later task than the one that settles the take. For any other event sent in the task that settles the take, reserve, then commit.
 
 ### A deadline inside the logic
 
-On a host that queues events, give the logic its own deadline instead of a machine timer. Async logic with a `timeout` aborts the abort signal passed to `run` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, so the result does not depend on how the host delivers the timer and the completion. On `createActor` this adds nothing beyond the rules, and it does not prevent work after the take, a take that settles later or an exit in the same task. For an Effect task, race the deadline inside the task, as the [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) section of the `@xstate/effect` actor logic guide shows.
+Async logic with a `timeout` aborts `signal` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, whatever order the host delivers events in. On `createActor` this adds nothing beyond the rules.
 
-The example assumes an in-memory queue, where `take` removes the item and settles its promise in the same task:
+On every host, the deadline still loses an item to work after the take, a take that settles later or an exit in the same task. For `createEffectLogic`, see [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide. The example assumes an in-memory queue, whose `take` removes the item in the task that settles it:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
 ```ts
@@ -315,19 +320,23 @@ export interface MessageQueue {
 export function createRetryMachine(messages: MessageQueue) {
   // The logic owns the deadline. After four seconds it aborts `signal`,
   // which withdraws the pending take, and then errors with a TimeoutError.
+  // The return type gives `onDone` a typed `event.output`.
   const takeMessage = createAsyncLogic({
     timeout: 4_000,
-    run: ({ signal }) => messages.take(signal)
+    run: ({ signal }): Promise<string> => messages.take(signal)
   });
 
   return setup({ actors: { takeMessage } }).createMachine({
+    context: { message: null as string | null },
     initial: 'waiting',
     states: {
       waiting: {
         invoke: {
           src: 'takeMessage',
-          // The message is only a wake-up signal, so onDone ignores it.
-          onDone: { target: 'retryNow' },
+          onDone: ({ event }) => ({
+            target: 'retryNow',
+            context: { message: event.output }
+          }),
           onError: ({ event }) => ({
             target:
               event.error instanceof TimeoutError ? 'retryLater' : 'failed'
@@ -342,13 +351,53 @@ export function createRetryMachine(messages: MessageQueue) {
 }
 ```
 
+A deadline inside the logic behaves differently across persistence. With the default clock, an `after` timer saved from a running actor keeps its [original deadline](persistence.md#preserve-the-original-deadline) when restored. A restored async child [runs again](persistence.md#in-flight-children), so its own `timeout` restarts in full.
+
 ### Reserve, then commit
 
-When an item must survive any exit from the state, split the take in two. The child reserves the item and returns the reservation. The machine commits the reservation in the `onDone` transition, for example with an action that acknowledges the message. If the machine exits the state first, nothing commits, and the queue makes the item available again when the reservation expires. The item can then arrive twice, so handle it idempotently. Most brokers already offer this as a visibility timeout or an acknowledgement. The queue holds the item until the commit, so this also covers a take that settles later and an exit in the same task.
+When an item must survive any exit from the state, split the take in two. The child reserves the item and returns the reservation, and `onDone` commits it. If the machine exits the state first, nothing commits, and the queue makes the item available again when the reservation expires. The item can then arrive twice, so handle it idempotently. Most brokers already offer this as a visibility timeout or an acknowledgement. The queue holds the item until the commit, so this also covers a take that settles later and an exit in the same task. A plain `after` on the same state is then safe:
 
-### Deadlines across persistence
+<!-- tested example: packages/core/test/fixtures/invoke-deadline/reserve-then-commit.ts -->
+```ts
+import { createAsyncLogic, setup } from 'xstate';
 
-A deadline inside the logic behaves differently across persistence. With the default clock, an `after` timer saved from a running actor keeps its [original deadline](persistence.md#preserve-the-original-deadline) when restored. A restored async child [runs again](persistence.md#in-flight-children), so its own `timeout` restarts in full.
+type Reservation = { id: string; job: string };
+
+/** Your broker. A reservation hides the job until it is committed or expires. */
+export interface JobQueue {
+  reserve(signal: AbortSignal): Promise<Reservation>;
+  commit(id: string): Promise<void>;
+}
+
+export function createJobMachine(jobs: JobQueue) {
+  const reserveJob = createAsyncLogic({
+    run: ({ signal }): Promise<Reservation> => jobs.reserve(signal)
+  });
+
+  return setup({ actors: { reserveJob } }).createMachine({
+    context: { job: null as string | null },
+    initial: 'waiting',
+    states: {
+      waiting: {
+        invoke: {
+          src: 'reserveJob',
+          // Only this transition commits. If the timer exits first, the
+          // reservation expires and the broker offers the job again.
+          onDone: ({ event }, enq) => {
+            enq(() => jobs.commit(event.output.id));
+            return { target: 'accepted', context: { job: event.output.job } };
+          }
+        },
+        after: { 4_000: { target: 'idle' } }
+      },
+      accepted: {},
+      idle: {}
+    }
+  });
+}
+```
+
+Committing in `onDone` is safe when that transition finishes the work or hands it off durably. If work after the commit fails, the queue does not redeliver the job, so commit after that work instead.
 
 ## Referencing the child
 
