@@ -10,8 +10,9 @@ export class Signals extends Context.Service<Signals, Queue.Queue<string>>()(
   '@app/Signals'
 ) {}
 
-// One Effect owns both outcomes. When the deadline wins, the race interrupts
-// the take before it removes anything from the queue.
+// One Effect owns both outcomes. The take branch holds only the take and one
+// Effect.map, so it finishes in the step that removes the item. When the
+// deadline wins, the race interrupts the take before it removes anything.
 const nextSignal = createEffectLogic(
   Signals.use((signals) =>
     Effect.raceFirst(
@@ -23,7 +24,9 @@ const nextSignal = createEffectLogic(
   )
 );
 
-const retryMachine = setupEffect({ actors: { nextSignal } }).createMachine({
+export const retryMachine = setupEffect({
+  actors: { nextSignal }
+}).createMachine({
   initial: 'waiting',
   states: {
     waiting: {

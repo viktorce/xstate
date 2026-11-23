@@ -90,15 +90,15 @@ Use Effect's retry and timeout combinators inside the task.
 
 ### Racing a deadline
 
-The root machine under `createEffectActor` receives events through one mailbox and handles them in the order they arrive. A state timer and an invoked task both report there. An `after`, a state `timeout` or an invoke `timeout` is one event, and the task's result is another. A task that finished before the timer fired wins. A nested machine receives its events directly instead of through the mailbox.
+A state timer can drop an item that an invoked task already took. An `after`, a state `timeout` or an invoke `timeout` is one event, and the task's result is another. If the timer's transition exits the invoking state before the machine handles the result, the machine stops the task. The item it took is lost, whether the task was still running or had already finished and queued its result behind the timer. Nothing reports the drop as an error. The core guide explains [which transitions stop a child](../../../docs/invoke.md#racing-an-invocation-against-a-timer).
 
 A task that keeps working after it takes an item can lose that item to a timer that fires before it finishes.
 
-The loss can also happen when the timer's event is already in the mailbox and the task then takes an item from a `Queue`. That can happen even if the item was offered before the timer fired, because Effect resumes a waiting `Queue.take` on a later scheduler step.
+The root machine under `createEffectActor` receives events through one mailbox and handles them in the order they arrive. The timer's event can already be in the mailbox when the task takes an item from a `Queue`. That can happen even if the item was offered before the timer fired, because Effect can resume a waiting `Queue.take` on a later step. A step here is one run of a fiber, from when the scheduler resumes it until it waits or yields. A nested machine receives its events directly and handles the timer when it fires, so this case does not apply to it.
 
-If the timer's transition exits the invoking state, the machine stops the task. The item it took is lost, whether the task was still running or had already finished and queued its result behind the timer. Nothing reports the drop as an error. The core guide explains [which transitions stop a child](../../../docs/invoke.md#racing-an-invocation-against-a-timer).
+When the result must not be lost to a timer, race the deadline inside the task. `Effect.raceFirst` interrupts the loser in the same step that the winner finishes, and `Queue.take` removes an item and returns it in one step. This rests on how Effect 4.0 implements the race and the queue. A take branch that finishes in the step that removes the item therefore either wins with the item or ends without removing it, even when the item arrives at the instant the deadline fires.
 
-When the result must not be lost to a timer, race the deadline inside the task. With Effect's default scheduler, `Effect.raceFirst` interrupts the loser in the same step that the winner finishes, and `Queue.take` removes an item and returns it in one step. The take therefore either wins with the item or ends without removing it, even when the item arrives at the instant the deadline fires. A custom scheduler that yields between the winner finishing and the interruption can let the take remove an item after the deadline won.
+The branch may hold the take and one plain function in `Effect.map`, nothing more. A fiber also yields on its own after `Scheduler.MaxOpsBeforeYield` operations. Any further Effect after the take, synchronous or not, is a point where the fiber can yield, which makes it work after the take. If the fiber yields there, the deadline can win after the take removed the item. A custom scheduler, or a `MaxOpsBeforeYield` setting low enough that a fiber yields right after the take or before the race interrupts the loser, can lose the item even with that shape. For an item that must survive in every case, use [reserve, then commit](../../../docs/invoke.md#reserve-then-commit).
 
 <!-- example from examples/effect-workflows/src/deadline.ts -->
 
@@ -115,8 +115,9 @@ export class Signals extends Context.Service<Signals, Queue.Queue<string>>()(
   '@app/Signals'
 ) {}
 
-// One Effect owns both outcomes. When the deadline wins, the race interrupts
-// the take before it removes anything from the queue.
+// One Effect owns both outcomes. The take branch holds only the take and one
+// Effect.map, so it finishes in the step that removes the item. When the
+// deadline wins, the race interrupts the take before it removes anything.
 const nextSignal = createEffectLogic(
   Signals.use((signals) =>
     Effect.raceFirst(
@@ -128,7 +129,9 @@ const nextSignal = createEffectLogic(
   )
 );
 
-const retryMachine = setupEffect({ actors: { nextSignal } }).createMachine({
+export const retryMachine = setupEffect({
+  actors: { nextSignal }
+}).createMachine({
   initial: 'waiting',
   states: {
     waiting: {
@@ -158,9 +161,9 @@ export const result = await Effect.runPromise(Effect.scoped(program));
 console.log(result); // 'retryNow'
 ```
 
-- `onDone` receives either outcome, so the race removes the competing timer. Another transition out of `waiting`, or stopping the actor, can still interrupt the task after it took an item and discard that item.
-- The consuming step must either finish with the item or leave it in the source when interrupted. `Queue.take` does. Other sources may not.
-- Nothing asynchronous may follow the consuming step inside the raced branch, only synchronous mapping such as `Effect.map`. Avoid a branch shaped like `Queue.take(q).pipe(Effect.flatMap(save))`, which can lose the deadline race after it took the item.
+- `onDone` handles both outcomes, so no machine timer competes with the task. Another transition out of `waiting`, or stopping the actor, can still interrupt the task after it took an item and discard that item.
+- The consuming call must either finish with the item or leave it in the source when interrupted. `Queue.take` does. Other sources may not.
+- Avoid a branch shaped like `Queue.take(q).pipe(Effect.flatMap(save))`, or a long chain of `Effect.map` calls. Either can lose the race after it took the item.
 - `Effect.timeoutOption` works the same way and returns `Option.none()` at the deadline.
 - The deadline restarts in full when the actor is restored, because a running Effect task starts again from the beginning. A pending `after` timer keeps its original deadline. See [persisting and restoring](actors.md#persisting-and-restoring).
 - Keep `after` and `timeout` for work that is safe to repeat or abandon.
