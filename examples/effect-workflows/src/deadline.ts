@@ -10,8 +10,8 @@ export class Signals extends Context.Service<Signals, Queue.Queue<string>>()(
   '@app/Signals'
 ) {}
 
-// One Effect owns both outcomes. When the deadline wins, the take is
-// interrupted before it removes anything from the queue.
+// One Effect owns both outcomes. When the deadline wins, the race interrupts
+// the take before it removes anything from the queue.
 const nextSignal = createEffectLogic(
   Signals.use((signals) =>
     Effect.raceFirst(
