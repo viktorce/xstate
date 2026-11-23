@@ -19,6 +19,7 @@ export function createRetryMachine(messages: MessageQueue) {
       waiting: {
         invoke: {
           src: 'takeMessage',
+          // The message is only a wake-up signal, so onDone ignores it.
           onDone: { target: 'retryNow' },
           onError: ({ event }) => ({
             target:
