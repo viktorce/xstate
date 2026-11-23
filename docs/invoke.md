@@ -290,7 +290,7 @@ waiting: {
 A child that consumes from a queue keeps its result against a timer when it follows three rules:
 
 - `take` must stop waiting when the abort signal aborts. Otherwise a stopped actor stays subscribed and takes the next item.
-- After the take settles, `run` does only synchronous work and returns the value itself, not a promise that is still pending. It prevents work after the take.
+- After the take settles, `run` does only synchronous work and returns the value itself, not a promise that is still pending. This rule prevents work after the take.
 - `take` must remove the item in the same task that settles its promise. A take that settles later needs [reserve, then commit](#reserve-then-commit).
 
 On `createActor` with the default clock and real timers, a child that follows these rules does not lose a result to `after`, a state `timeout` or an invoke `timeout`. If the child finished first, its completion wins. If the timer wins, the machine stops the child, which aborts the abort signal passed to `run`. The take withdraws, and the item stays in the queue.

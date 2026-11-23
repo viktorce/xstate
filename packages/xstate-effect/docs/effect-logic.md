@@ -98,7 +98,7 @@ The loss can also happen when the timer's event is already in the mailbox and th
 
 If the timer's transition exits the invoking state, the machine stops the task. The item it took is lost, whether the task was still running or had already finished and queued its result behind the timer. Nothing reports the drop as an error. The core guide explains [which transitions stop a child](../../../docs/invoke.md#racing-an-invocation-against-a-timer).
 
-When the result must not be lost to a timer, race the deadline inside the task. `Effect.raceFirst` interrupts the loser in the same step that the winner finishes, and `Queue.take` removes an item and returns it in one step. The take therefore either wins with the item or ends without removing it, even when the item arrives at the instant the deadline fires:
+When the result must not be lost to a timer, race the deadline inside the task. With Effect's default scheduler, `Effect.raceFirst` interrupts the loser in the same step that the winner finishes, and `Queue.take` removes an item and returns it in one step. The take therefore either wins with the item or ends without removing it, even when the item arrives at the instant the deadline fires. A custom scheduler that yields between the winner finishing and the interruption can let the take remove an item after the deadline won.
 
 <!-- example from examples/effect-workflows/src/deadline.ts -->
 
