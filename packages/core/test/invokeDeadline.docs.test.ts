@@ -70,12 +70,14 @@ const createTimerMachine = (waiting: object) =>
 const takeOnly = (queue: MessageQueue) =>
   createAsyncLogic({ run: ({ signal }) => queue.take(signal) });
 
-// The case the docs call work after the take.
-const takeThenSave = (queue: MessageQueue) =>
+// Passes `signal` to the take and returns `ms` after it settles. This is the
+// case the docs call asynchronous work after the take. To the machine, a take
+// that settles later looks the same.
+const takeThenWait = (ms: number) => (queue: MessageQueue) =>
   createAsyncLogic({
     run: async ({ signal }) => {
       const value = await queue.take(signal);
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000));
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
       return value;
     }
   });
@@ -242,14 +244,11 @@ describe('a targetless onDone', () => {
 });
 
 // Rejects when signal aborts but leaves its request with the queue.
-const takeWithoutWithdrawing = (queue: MessageQueue, replyAfter?: number) =>
+const takeWithoutWithdrawing = (queue: MessageQueue) =>
   createAsyncLogic({
     run: ({ signal }) =>
       new Promise<string>((resolvePromise, reject) => {
-        void queue.take(new AbortController().signal).then((value) => {
-          if (replyAfter) setTimeout(() => resolvePromise(value), replyAfter);
-          else resolvePromise(value);
-        });
+        void queue.take(new AbortController().signal).then(resolvePromise);
         signal.addEventListener('abort', () => reject(signal.reason));
       })
   });
@@ -258,13 +257,13 @@ const takeWithoutWithdrawing = (queue: MessageQueue, replyAfter?: number) =>
 it.each<[string, (queue: MessageQueue) => AnyActorLogic, number]>([
   [
     'a take that rejects without withdrawing its request, offered long after the timer',
-    (queue) => takeWithoutWithdrawing(queue),
+    takeWithoutWithdrawing,
     10_000
   ],
-  ['work after the take, offered at 3.5 seconds', takeThenSave, 3_500],
+  ['work after the take, offered at 3.5 seconds', takeThenWait(1_000), 3_500],
   [
     'a take that settles later, offered at 3.95 seconds',
-    (queue) => takeWithoutWithdrawing(queue, 100),
+    takeThenWait(100),
     3_950
   ]
 ])('loses the message to %s', async (_case, createChild, offerAt) => {
@@ -303,6 +302,21 @@ describe('an exit in the same turn', () => {
     actor.send({ type: 'giveUp' });
     await vi.advanceTimersByTimeAsync(1);
     expect({ ...outcome(actor), items }).toEqual(expected);
+    actor.stop();
+  });
+
+  it('loses the message when an exit action of the state offers it and the timer exits', async () => {
+    const { queue, items } = createMessageQueue();
+    const offer = vi.fn(() => queue.offer('config changed'));
+    const actor = createActor(
+      createTimerMachine({
+        ...timers.after(takeOnly(queue)),
+        exit: (_: unknown, enq: (effect: () => void) => void) => enq(offer)
+      })
+    ).start();
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(offer).toHaveBeenCalledOnce();
+    expect({ ...outcome(actor), items }).toEqual(lost);
     actor.stop();
   });
 
