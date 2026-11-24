@@ -1,4 +1,4 @@
-import { Effect, Fiber, Queue, Scope } from 'effect';
+import { Clock, Effect, Queue, Scope } from 'effect';
 import { TestClock } from 'effect/testing';
 import { createEffectActor, waitFor, type EffectActor } from '@xstate/effect';
 import { Messages, retryMachine } from '../src/deadline.ts';
@@ -32,35 +32,41 @@ it('reaches retryLater with no message when none arrives before the deadline', a
   expect(result).toEqual({ value: 'retryLater', message: null });
 });
 
-// A producer sleeps to the instant the deadline fires, armed before or after
-// the task's deadline. Either winner is valid. Taking the message and then
+// The message reaches the waiting take and the deadline ends in one
+// synchronous step. A Clock whose sleep ends only when the test calls
+// `wakeDeadline` decides that step, and `Queue.flushUnsafe` hands the message
+// to the take at once. Either winner is valid. Taking the message and then
 // reporting the deadline is not.
 it.each([
-  ['the producer', true],
-  ['the deadline', false]
-] as const)(
-  'keeps the message at a tie when %s is armed first',
-  async (_first, producerFirst) => {
-    const result = await runOnTestClock(
-      Effect.gen(function* () {
-        const messages = yield* Messages;
-        const produce = Effect.sleep('4 seconds').pipe(
-          Effect.andThen(Queue.offer(messages, 'config changed'))
-        );
-        const early = producerFirst ? yield* Effect.forkChild(produce) : null;
-        const actor = yield* createEffectActor(retryMachine);
-        // Lets the task start and arm its deadline.
-        for (let i = 0; i < 10; i++) yield* Effect.yieldNow;
-        const producer = early ?? (yield* Effect.forkChild(produce));
-        yield* TestClock.adjust('4 seconds');
-        const reported = yield* finish(actor);
-        yield* Fiber.join(producer);
-        return { ...reported, size: yield* Queue.size(messages) };
-      })
-    );
-    expect([
-      { value: 'retryNow', message: 'config changed', size: 0 },
-      { value: 'retryLater', message: null, size: 1 }
-    ]).toContainEqual(result);
-  }
-);
+  ['the take gets the message first', true],
+  ['the deadline ends first', false]
+] as const)('keeps the message at a tie when %s', async (_order, takeFirst) => {
+  const result = await runOnTestClock(
+    Effect.gen(function* () {
+      const messages = yield* Messages;
+      let wakeDeadline: (() => void) | undefined;
+      const clock: Clock.Clock = Object.create(yield* Clock.Clock);
+      clock.sleep = () =>
+        Effect.callback((resume) => {
+          wakeDeadline = () => resume(Effect.void);
+        });
+      const actor = yield* createEffectActor(retryMachine).pipe(
+        Effect.provideService(Clock.Clock, clock)
+      );
+      for (let i = 0; i < 100 && !wakeDeadline; i++) yield* Effect.yieldNow;
+      const deliver = () => {
+        Queue.offerUnsafe(messages, 'config changed');
+        Queue.flushUnsafe(messages);
+      };
+      if (takeFirst) deliver();
+      wakeDeadline!();
+      if (!takeFirst) deliver();
+      const reported = yield* finish(actor);
+      return { ...reported, size: yield* Queue.size(messages) };
+    })
+  );
+  expect([
+    { value: 'retryNow', message: 'config changed', size: 0 },
+    { value: 'retryLater', message: null, size: 1 }
+  ]).toContainEqual(result);
+});

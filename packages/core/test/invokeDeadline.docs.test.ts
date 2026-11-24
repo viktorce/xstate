@@ -139,6 +139,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// The @xstate/effect race test imports take-or-deadline.ts as well.
 it.each(['take-or-deadline.ts', 'reserve-then-commit.ts'])(
   'keeps the documented %s in sync with its fixture',
   (fixture) => {
@@ -170,7 +171,7 @@ describe.each([
     async (_description, messageFirst, expected) => {
       const { queue, items } = createMessageQueue();
       const { actor } = startAtTie(createRacer(queue), queue, messageFirst);
-      // The async fake-timer API runs each timer in its own task, as real
+      // The async fake-timer API runs each timer in its own event-loop turn, as real
       // timers do.
       await vi.advanceTimersByTimeAsync(4_000);
       expect({ ...outcome(actor), items }).toEqual(expected);
@@ -280,14 +281,14 @@ it.each<[string, (queue: MessageQueue) => AnyActorLogic, number]>([
   actor.stop();
 });
 
-describe('an exit in the same task', () => {
+describe('an exit in the same turn', () => {
   it.each([
     [
-      'loses the message to an event sent in the task that settles the take',
+      'loses the message to an event sent in the turn that settles the take',
       true,
       lost
     ],
-    ['keeps the message when the event is sent in a later task', false, won]
+    ['keeps the message when the event is sent in a later turn', false, won]
   ] as const)('%s', async (_description, sameTask, expected) => {
     const { queue, items } = createMessageQueue();
     const actor = createActor(
@@ -308,8 +309,8 @@ describe('an exit in the same task', () => {
   });
 
   it.each([
-    ['in the task that offers it, loses the message', true, lost],
-    ['in a later task than the offer, reports the message', false, won]
+    ['in the turn that offers it, loses the message', true, lost],
+    ['in a later turn than the offer, reports the message', false, won]
   ] as const)(
     'with a simulated clock advanced %s',
     async (_description, sameTask, expected) => {
@@ -326,7 +327,7 @@ describe('an exit in the same task', () => {
     }
   );
 
-  it('loses a message when synchronous fake timers fire the offer and the deadline in one task', async () => {
+  it('loses a message when synchronous fake timers fire the offer and the deadline in one turn', async () => {
     // The offer is armed first, so it fires first, but the take has not
     // reported when the deadline fires in the same task.
     const { queue, items } = createMessageQueue();
@@ -359,10 +360,8 @@ describe('the documented reserve, then commit example', () => {
     };
     const reserve = (next: Job) => {
       const receipt = `receipt-${++receipts}`;
-      expiries.set(
-        receipt,
-        setTimeout(() => offer(next), 10_000)
-      );
+      const expire = () => expiries.delete(receipt) && offer(next);
+      expiries.set(receipt, setTimeout(expire, 10_000));
       return fail === 'reserve'
         ? Promise.reject(new Error('reply lost'))
         : Promise.resolve({ receipt, job: next });
@@ -378,7 +377,9 @@ describe('the documented reserve, then commit example', () => {
         }),
       commit: async (receipt) => {
         if (fail === 'commit') throw new Error('broker unavailable');
+        if (!expiries.has(receipt)) throw new Error('reservation expired');
         clearTimeout(expiries.get(receipt));
+        expiries.delete(receipt);
         log.push(`committed ${receipt}`);
       }
     };
@@ -392,13 +393,19 @@ describe('the documented reserve, then commit example', () => {
 
   // By 11 seconds a reservation that was not committed has expired.
   it.each([
-    ['nothing', 'done', ['worked job-1', 'committed receipt-1'], []],
-    ['reserve', 'idle', [], [job]],
-    ['work', 'idle', [], [job]],
-    ['commit', 'idle', ['worked job-1'], [job]]
+    [
+      'nothing',
+      'done',
+      'commits the job, which does not return',
+      ['worked job-1', 'committed receipt-1'],
+      []
+    ],
+    ['reserve', 'idle', 'the job returns', [], [job]],
+    ['work', 'idle', 'the job returns', [], [job]],
+    ['commit', 'idle', 'the job returns', ['worked job-1'], [job]]
   ] as const)(
-    'when %s fails, stays active in %s, and the job returns unless committed',
-    async (fail, value, log, ready) => {
+    'when %s fails, stays active in %s and %s',
+    async (fail, value, _outcome, log, ready) => {
       const broker = createBroker(fail);
       const actor = createActor(broker.machine).start();
       broker.offer(job);
@@ -414,11 +421,11 @@ describe('the documented reserve, then commit example', () => {
     }
   );
 
-  it('commits nothing when the timer exits in the task that delivers the reservation, and the job returns', async () => {
+  it('commits nothing when the timer exits in the turn that delivers the reservation, and the job returns', async () => {
     const broker = createBroker('nothing');
     setTimeout(() => broker.offer(job), 4_000);
     const actor = createActor(broker.machine).start();
-    // Synchronous fake timers fire the delivery and the timer in one task.
+    // Synchronous fake timers fire the delivery and the timer in one turn.
     vi.advanceTimersByTime(4_000);
     await vi.advanceTimersByTimeAsync(0);
     expect(actor.getSnapshot().value).toBe('idle');

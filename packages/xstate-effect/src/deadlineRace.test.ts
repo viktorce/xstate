@@ -23,7 +23,8 @@ type Outcome = { kind: 'message'; message: string } | { kind: 'deadline' };
 const toMessage = (message: string) => ({ kind: 'message' as const, message });
 
 // The machine from examples/effect-workflows/src/deadline.ts and, for the
-// pattern the docs warn about, an `after` timer.
+// pattern the docs warn about, an `after` timer. The example exports one
+// machine, and the variants below need a factory, so this copies it.
 function createRetryMachine(
   task: Effect.Effect<Outcome, never, Messages>,
   timer?: 'after'
@@ -77,12 +78,15 @@ function createParentMachine(child: AnyStateMachine) {
 const takeMessage = (messages: Queue.Queue<string>) =>
   Queue.take(messages).pipe(Effect.map(toMessage));
 
-const raceFirst = (branch = takeMessage) =>
+const raceFirst = (
+  branch = takeMessage,
+  deadline: Duration.Input = '4 seconds'
+) =>
   createRetryMachine(
     Messages.use((messages) =>
       Effect.raceFirst(
         branch(messages),
-        Effect.sleep('4 seconds').pipe(Effect.as({ kind: 'deadline' as const }))
+        Effect.sleep(deadline).pipe(Effect.as({ kind: 'deadline' as const }))
       )
     )
   );
@@ -103,6 +107,7 @@ const timeoutOption = createRetryMachine(
 
 const afterTimer = createRetryMachine(Messages.use(takeMessage), 'after');
 
+// The example test covers the take-only Effect.raceFirst branch at a tie.
 const machines = {
   'Effect.raceFirst': raceFirst(),
   'Effect.raceFirst and Effect.yieldNow after the take': raceFirst((messages) =>
@@ -236,13 +241,7 @@ const outcomes = {
 
 describe('a message that arrives at the instant the timer ends', () => {
   it.each([
-    [
-      'Effect.raceFirst',
-      'offered to the waiting take before the timer ends',
-      'reports it'
-    ],
     ['Effect.raceFirst', 'offered before the timer ends', 'keeps it queued'],
-    ['Effect.raceFirst', 'offered after the timer ends', 'keeps it queued'],
     [
       'Effect.raceFirst and Effect.yieldNow after the take',
       'offered to the waiting take before the timer ends',
@@ -252,6 +251,11 @@ describe('a message that arrives at the instant the timer ends', () => {
       'Effect.raceFirst and an asynchronous save after the take',
       'offered to the waiting take before the timer ends',
       'loses it'
+    ],
+    [
+      'Effect.timeoutOption',
+      'offered to the waiting take before the timer ends',
+      'reports it'
     ],
     [
       'Effect.timeoutOption',
@@ -287,6 +291,34 @@ describe('a message that arrives at the instant the timer ends', () => {
       expect(result).toEqual(outcomes[expected]);
     }
   );
+});
+
+// Ties on the real clock, with the offer armed before or after the actor
+// starts. Real timers do not promise an order, so either winner is valid.
+it('keeps the message at ties with Effect.raceFirst on the real clock', async () => {
+  const machine = raceFirst(takeMessage, 5);
+  for (const messageFirst of [true, false, true, false, true, false]) {
+    const result = await Effect.gen(function* () {
+      const messages = yield* Queue.unbounded<string>();
+      const offer = () =>
+        new Promise<void>((done) =>
+          setTimeout(() => {
+            Queue.offerUnsafe(messages, 'config changed');
+            done();
+          }, 5)
+        );
+      const early = messageFirst ? offer() : undefined;
+      const actor = yield* createEffectActor(machine).pipe(
+        Effect.provideService(Messages, messages)
+      );
+      yield* Effect.promise(() => early ?? offer());
+      return yield* outcome(actor, messages);
+    }).pipe(Effect.scoped, Effect.runPromise);
+    expect([
+      outcomes['reports it'],
+      outcomes['keeps it queued']
+    ]).toContainEqual(result);
+  }
 });
 
 // The documented core deadline example under createEffectActor, with a take
