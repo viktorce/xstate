@@ -2,4 +2,4 @@
 '@xstate/effect': patch
 ---
 
-Document how a state timer can lose an invoked Effect task's result, and how racing the deadline inside the task with `Effect.raceFirst` or `Effect.timeoutOption` keeps the item it took on Effect 4.0.2 or later. The guide says which branch shape keeps the item and which steps after the take can lose it.
+Document how a state timer can lose an item that an invoked Effect task took, and how to race the deadline inside the task instead. On Effect 4.0.2 or later, the documented branch of `Queue.take` and one `Effect.map`, raced with `Effect.raceFirst`, either wins with the item or leaves it in the queue.

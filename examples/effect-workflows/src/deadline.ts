@@ -10,9 +10,9 @@ export class Messages extends Context.Service<Messages, Queue.Queue<string>>()(
   '@app/Messages'
 ) {}
 
-// One Effect owns both outcomes. After the take, the branch runs only
-// synchronous steps, so it finishes in the step that removes the item. When
-// the deadline wins, the race interrupts the take before it removes anything.
+// One Effect owns both outcomes. The take branch is Queue.take and one
+// Effect.map, so it finishes in the step that removes the item. When the
+// deadline wins, the race interrupts the take before it removes anything.
 const nextMessage = createEffectLogic(
   Messages.use((messages) =>
     Effect.raceFirst(

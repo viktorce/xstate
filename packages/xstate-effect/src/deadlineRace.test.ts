@@ -239,6 +239,8 @@ const outcomes = {
   'loses it': { value: 'retryLater', message: null, size: 0 }
 };
 
+// No row covers the operation budget, whose threshold is an Effect internal.
+// A row that expects a loss is a deliberate alarm for an Effect upgrade.
 describe('a message that arrives at the instant the timer ends', () => {
   it.each([
     ['Effect.raceFirst', 'offered before the timer ends', 'keeps it queued'],
@@ -342,9 +344,8 @@ describe('the core deadline example under createEffectActor', () => {
     return { machine: createAsyncRetryMachine(queue), items, offer };
   }
 
-  // Async logic arms its own timeout on the global setTimeout, which vitest
-  // fakes here. Effect schedules its own steps with setImmediate, which stays
-  // real.
+  // Async logic times out on the global setTimeout, which vitest fakes here.
+  // Effect schedules its steps with setImmediate, which stays real.
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   });
@@ -353,8 +354,7 @@ describe('the core deadline example under createEffectActor', () => {
     vi.useRealTimers();
   });
 
-  // The child starts on the actor's fiber. Waits until it has armed its
-  // deadline.
+  // Waits until the child, started on the actor's fiber, arms its deadline.
   const armed = Effect.gen(function* () {
     for (let i = 0; i < 100 && vi.getTimerCount() === 0; i++) {
       yield* Effect.yieldNow;
@@ -377,7 +377,7 @@ describe('the core deadline example under createEffectActor', () => {
           valueAtOffer = actor.getSnapshot().value;
           offer('config changed');
         }, 4_000);
-        // Both timers fire in one task, so the message arrives after the
+        // Both timers fire in one turn, so the message arrives after the
         // deadline aborted the take and before the machine handles it.
         vi.advanceTimersByTime(4_000);
         const { value } = yield* settled(actor);
@@ -397,8 +397,10 @@ describe('the core deadline example under createEffectActor', () => {
         const valueAtDeadline = yield* Effect.promise(async () => {
           vi.advanceTimersByTime(3_999);
           offer('config changed');
-          // The take settles in these microtasks, before Effect's next step.
-          for (let i = 0; i < 10; i++) await Promise.resolve();
+          // The child finishes in microtasks, before Effect's next step.
+          const [child] = Object.values(actor.getSnapshot().children);
+          for (let i = 0; i < 100 && child.getSnapshot().status !== 'done'; i++)
+            await Promise.resolve();
           vi.advanceTimersByTime(1);
           return actor.getSnapshot().value;
         });

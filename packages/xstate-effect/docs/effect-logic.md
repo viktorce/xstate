@@ -92,11 +92,21 @@ Use Effect's retry and timeout combinators inside the task.
 
 A state timer can make the machine lose an item that an invoked task already took. An `after`, a state `timeout` or an invoke `timeout` is one event, and the task's result is another. If the timer's transition exits the invoking state before the machine handles the result, the machine stops the task. The item it took is lost, whether the task was still running or had already finished and queued its result behind the timer. Nothing reports the loss as an error. The core guide explains [what stops a child](../../../docs/invoke.md#racing-an-invocation-against-a-timer).
 
-The root machine under `createEffectActor` receives events through one mailbox and handles them in the order they arrive. The timer's event can already be in the mailbox when the task takes an item from a `Queue`. That can happen even if the item was offered before the timer fired, because Effect can resume a waiting `Queue.take` on a later step. A step here is one run of a fiber, from when it resumes until it waits or yields. A nested machine receives its events directly and handles the timer when it fires, so this case does not apply to it.
+The root machine under `createEffectActor` receives events through one mailbox and handles them in the order they arrive. The timer's event can already be in the mailbox when the task takes an item from a `Queue`. That can happen even if the item was offered before the timer fired, because Effect can resume a waiting `Queue.take` on a later step. A step here is one run of a fiber, from when it resumes until it waits, yields or ends, together with the fibers it resumes synchronously, such as a race waiting for it. A nested machine receives its events directly and handles the timer when it fires, so this case does not apply to it.
 
-When the result must not be lost to a timer, race the deadline inside the task. `Effect.raceFirst` interrupts the loser in the same step that the winner finishes, and `Queue.take` removes an item and returns it in one step. Both rest on Effect's implementation in version 4.0.2 or later. A branch whose steps after `Queue.take` are synchronous and do not throw, such as `Effect.map` or plain code in `Effect.gen`, then either wins with the item or ends without removing it, even when the item arrives at the instant the deadline fires. This needs Effect's default scheduler, `Clock` and `Scheduler.MaxOpsBeforeYield`, and no code that flushes a dispatcher by hand.
+When the result must not be lost to a timer, race the deadline inside the task, as the example below does. This needs Effect 4.0.2 or later. On 4.0.0 and 4.0.1, a waiting take under `Effect.timeoutOption` can return `Option.none()` after it removed an item.
 
-The deadline can win after the take removed the item if the branch then runs an asynchronous step, as in `Queue.take(q).pipe(Effect.flatMap(save))`, or yields with `Effect.yieldNow`. So can more than about 2,000 Effect operations in the step that takes the item, counting those before the take, because the fiber then yields. A slow function inside one `Effect.map` counts as one operation. For an item that must survive in every case, use [reserve, then commit](../../../docs/invoke.md#reserve-then-commit).
+The example's raced branch is `Queue.take` followed by one `Effect.map`. `Queue.take` removes an item and returns it in one step, and `Effect.raceFirst` interrupts the losing branch before the winner's step ends. That branch therefore either wins with the item or ends without removing it, even when the item arrives at the instant the deadline fires. This rests on Effect's implementation, with its default scheduler and `Scheduler.MaxOpsBeforeYield`.
+
+A different branch keeps that property only if its take stays interruptible and the branch finishes in the step that takes the item. Each of these breaks it:
+
+- An asynchronous step after the take, as in `Queue.take(q).pipe(Effect.flatMap(save))`, or a yield with `Effect.yieldNow`.
+- More than about 2,000 Effect operations in the step that takes the item, counting those before the take, because the fiber then yields. A slow function inside one `Effect.map` counts as one operation.
+- `Effect.uninterruptible` around the take.
+- A child fiber forked with `Effect.forkChild` whose cleanup takes time, because the branch waits for that cleanup before it finishes.
+- Code that ends the deadline from inside the step that takes the item, such as a hand-written `Clock` woken there or a `dispatcher.flush()` called there.
+
+For an item that must survive in every case, use [reserve, then commit](../../../docs/invoke.md#reserve-then-commit).
 
 <!-- example from examples/effect-workflows/src/deadline.ts -->
 
@@ -113,9 +123,9 @@ export class Messages extends Context.Service<Messages, Queue.Queue<string>>()(
   '@app/Messages'
 ) {}
 
-// One Effect owns both outcomes. After the take, the branch runs only
-// synchronous steps, so it finishes in the step that removes the item. When
-// the deadline wins, the race interrupts the take before it removes anything.
+// One Effect owns both outcomes. The take branch is Queue.take and one
+// Effect.map, so it finishes in the step that removes the item. When the
+// deadline wins, the race interrupts the take before it removes anything.
 const nextMessage = createEffectLogic(
   Messages.use((messages) =>
     Effect.raceFirst(
@@ -163,7 +173,7 @@ console.log(result); // { value: 'retryNow', message: 'config changed' }
 
 - `onDone` handles both outcomes, so no machine timer competes with the task. Another transition out of `waiting`, an explicit `enq.stop` of the task, or stopping the actor can still lose an item the task took.
 - The consuming call must either finish with the item or leave it in the source when interrupted. `Queue.take` does. Other sources may not.
-- `Effect.timeoutOption` runs the same race, with the same Effect version and branch rules, and returns `Option.none()` at the deadline.
+- `Effect.timeoutOption` runs the same race under the same conditions and returns `Option.none()` at the deadline.
 - The deadline restarts in full when the actor is restored, because a running Effect task starts again from the beginning. A pending `after` timer keeps its original deadline. See [persisting and restoring](actors.md#persisting-and-restoring).
 - Keep `after` and `timeout` for work that is safe to repeat or abandon.
 

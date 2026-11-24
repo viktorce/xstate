@@ -35,8 +35,9 @@ it('reaches retryLater with no message when none arrives before the deadline', a
 // The message reaches the waiting take and the deadline ends in one
 // synchronous step. A Clock whose sleep ends only when the test calls
 // `wakeDeadline` decides that step, and `Queue.flushUnsafe` hands the message
-// to the take at once. Either winner is valid. Taking the message and then
-// reporting the deadline is not.
+// to the take at once. The first of the two wins, and the loser keeps nothing.
+const reported = { value: 'retryNow', message: 'config changed', size: 0 };
+const kept = { value: 'retryLater', message: null, size: 1 };
 it.each([
   ['the take gets the message first', true],
   ['the deadline ends first', false]
@@ -65,8 +66,5 @@ it.each([
       return { ...reported, size: yield* Queue.size(messages) };
     })
   );
-  expect([
-    { value: 'retryNow', message: 'config changed', size: 0 },
-    { value: 'retryLater', message: null, size: 1 }
-  ]).toContainEqual(result);
+  expect(result).toEqual(takeFirst ? reported : kept);
 });
