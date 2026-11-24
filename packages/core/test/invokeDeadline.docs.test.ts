@@ -171,8 +171,7 @@ describe.each([
     async (_description, messageFirst, expected) => {
       const { queue, items } = createMessageQueue();
       const { actor } = startAtTie(createRacer(queue), queue, messageFirst);
-      // The async fake-timer API runs each timer in its own event-loop turn, as real
-      // timers do.
+      // Async fake timers run each timer in its own turn, as real timers do.
       await vi.advanceTimersByTimeAsync(4_000);
       expect({ ...outcome(actor), items }).toEqual(expected);
       actor.stop();
@@ -193,7 +192,7 @@ it.each(timerNames)(
         const { actor, offered } = startAtTie(machine, queue, messageFirst, 5);
         await Promise.all([
           offered,
-          waitFor(actor, (s) => s.value !== 'waiting')
+          waitFor(actor, (s) => s.value !== 'waiting', { timeout: 1_000 })
         ]);
         actor.stop();
         return { ...outcome(actor), items };
@@ -242,15 +241,15 @@ describe('a targetless onDone', () => {
   );
 });
 
-// The server hands the message over at once and replies 100 ms later. An
-// abort rejects the pending reply, but the message has left the server.
-const takeThatSettlesLater = (queue: MessageQueue) =>
+// Rejects when signal aborts but leaves its request with the queue.
+const takeWithoutWithdrawing = (queue: MessageQueue, replyAfter?: number) =>
   createAsyncLogic({
     run: ({ signal }) =>
       new Promise<string>((resolvePromise, reject) => {
-        void queue
-          .take(new AbortController().signal)
-          .then((value) => setTimeout(() => resolvePromise(value), 100));
+        void queue.take(new AbortController().signal).then((value) => {
+          if (replyAfter) setTimeout(() => resolvePromise(value), replyAfter);
+          else resolvePromise(value);
+        });
         signal.addEventListener('abort', () => reject(signal.reason));
       })
   });
@@ -258,15 +257,14 @@ const takeThatSettlesLater = (queue: MessageQueue) =>
 // An after timer fires at 4 seconds in each case.
 it.each<[string, (queue: MessageQueue) => AnyActorLogic, number]>([
   [
-    'a take that ignores signal, offered long after the timer',
-    (queue) =>
-      takeOnly({ take: () => queue.take(new AbortController().signal) }),
+    'a take that rejects without withdrawing its request, offered long after the timer',
+    (queue) => takeWithoutWithdrawing(queue),
     10_000
   ],
   ['work after the take, offered at 3.5 seconds', takeThenSave, 3_500],
   [
     'a take that settles later, offered at 3.95 seconds',
-    takeThatSettlesLater,
+    (queue) => takeWithoutWithdrawing(queue, 100),
     3_950
   ]
 ])('loses the message to %s', async (_case, createChild, offerAt) => {
@@ -289,7 +287,7 @@ describe('an exit in the same turn', () => {
       lost
     ],
     ['keeps the message when the event is sent in a later turn', false, won]
-  ] as const)('%s', async (_description, sameTask, expected) => {
+  ] as const)('%s', async (_description, sameTurn, expected) => {
     const { queue, items } = createMessageQueue();
     const actor = createActor(
       createTimerMachine({
@@ -299,7 +297,7 @@ describe('an exit in the same turn', () => {
     ).start();
     await vi.advanceTimersByTimeAsync(1);
     queue.offer('config changed');
-    if (!sameTask) await vi.advanceTimersByTimeAsync(1);
+    if (!sameTurn) await vi.advanceTimersByTimeAsync(1);
     // In retryNow the event has no transition, which logs a warning.
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     actor.send({ type: 'giveUp' });
@@ -313,13 +311,13 @@ describe('an exit in the same turn', () => {
     ['in a later turn than the offer, reports the message', false, won]
   ] as const)(
     'with a simulated clock advanced %s',
-    async (_description, sameTask, expected) => {
+    async (_description, sameTurn, expected) => {
       const { queue, items } = createMessageQueue();
       const clock = new SimulatedClock();
       const actor = createActor(createRetryMachine(queue), { clock }).start();
       clock.increment(3_999);
       queue.offer('config changed');
-      if (sameTask) clock.increment(1);
+      if (sameTurn) clock.increment(1);
       await vi.advanceTimersByTimeAsync(0);
       clock.increment(1);
       expect({ ...outcome(actor), items }).toEqual(expected);
@@ -329,7 +327,7 @@ describe('an exit in the same turn', () => {
 
   it('loses a message when synchronous fake timers fire the offer and the deadline in one turn', async () => {
     // The offer is armed first, so it fires first, but the take has not
-    // reported when the deadline fires in the same task.
+    // reported when the deadline fires in the same turn.
     const { queue, items } = createMessageQueue();
     setTimeout(() => queue.offer('config changed'), 4_000);
     const actor = createActor(createRetryMachine(queue)).start();

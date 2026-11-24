@@ -1,6 +1,9 @@
 import { createAsyncLogic, setup, TimeoutError } from 'xstate';
 
-/** Your own queue. `take` must stop waiting when its abort signal aborts. */
+/**
+ * Your own queue. `take` must withdraw its pending request when its abort
+ * signal aborts.
+ */
 export interface MessageQueue {
   take(signal: AbortSignal): Promise<string>;
 }
