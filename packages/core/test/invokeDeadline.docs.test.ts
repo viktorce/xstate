@@ -7,6 +7,7 @@ import {
   createAsyncLogic,
   createMachine,
   SimulatedClock,
+  waitFor,
   type AnyActorLogic,
   type AnyStateMachine
 } from 'xstate';
@@ -97,19 +98,23 @@ type Timer = keyof typeof timers;
 const timerNames = Object.keys(timers) as Timer[];
 
 // Arms a plain timer that offers the message at the deadline, before or
-// after the actor arms its own timer.
+// after the actor arms its own timer. `offered` settles after the offer.
 function startAtTie(
   machine: AnyStateMachine,
   queue: { offer(value: string): void },
   messageFirst: boolean,
   ms = 4_000
 ) {
-  const offerAtDeadline = () =>
-    setTimeout(() => queue.offer('config changed'), ms);
+  let offered!: Promise<void>;
+  const offerAtDeadline = () => {
+    offered = new Promise((resolvePromise) =>
+      setTimeout(() => resolvePromise(queue.offer('config changed')), ms)
+    );
+  };
   if (messageFirst) offerAtDeadline();
   const actor = createActor(machine).start();
   if (!messageFirst) offerAtDeadline();
-  return actor;
+  return { actor, offered };
 }
 
 // Both timers end up on the global setTimeout, which vitest fakes here.
@@ -118,6 +123,7 @@ function startAtTie(
 // deadline is not.
 const won = { value: 'retryNow', message: 'config changed', items: [] };
 const kept = { value: 'retryLater', message: null, items: ['config changed'] };
+const lost = { ...kept, items: [] };
 const ties = [
   ['the message timer was armed first', true, won],
   ['the deadline was armed first', false, kept]
@@ -163,7 +169,7 @@ describe.each([
     'keeps the message at a tie when %s',
     async (_description, messageFirst, expected) => {
       const { queue, items } = createMessageQueue();
-      const actor = startAtTie(createRacer(queue), queue, messageFirst);
+      const { actor } = startAtTie(createRacer(queue), queue, messageFirst);
       // The async fake-timer API runs each timer in its own task, as real
       // timers do.
       await vi.advanceTimersByTimeAsync(4_000);
@@ -174,20 +180,26 @@ describe.each([
 });
 
 it.each(timerNames)(
-  'keeps the message at a tie with %s and real timers',
+  'keeps the message at ties with %s and real timers',
   async (timer) => {
     vi.useRealTimers();
-    const runs = [true, false].map(async (messageFirst) => {
-      const { queue, items } = createMessageQueue();
-      const machine = createTimerMachine(timers[timer](takeOnly(queue), 20));
-      const actor = startAtTie(machine, queue, messageFirst, 20);
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 40));
-      actor.stop();
-      return { ...outcome(actor), items };
-    });
-    // Real timers do not promise an order, so either winner is valid.
-    for (const result of await Promise.all(runs)) {
-      expect([won, kept]).toContainEqual(result);
+    // Five rounds of ties in both arming orders. Real timers do not promise
+    // an order, so either winner is valid.
+    for (let round = 0; round < 5; round++) {
+      const runs = [true, false].map(async (messageFirst) => {
+        const { queue, items } = createMessageQueue();
+        const machine = createTimerMachine(timers[timer](takeOnly(queue), 5));
+        const { actor, offered } = startAtTie(machine, queue, messageFirst, 5);
+        await Promise.all([
+          offered,
+          waitFor(actor, (s) => s.value !== 'waiting')
+        ]);
+        actor.stop();
+        return { ...outcome(actor), items };
+      });
+      for (const result of await Promise.all(runs)) {
+        expect([won, kept]).toContainEqual(result);
+      }
     }
   }
 );
@@ -229,16 +241,42 @@ describe('a targetless onDone', () => {
   );
 });
 
-it('loses a message to an after timer that fires during work after the take', async () => {
-  // The child takes the message at 3.5 seconds and saves it for a second.
+// The server hands the message over at once and replies 100 ms later. An
+// abort rejects the pending reply, but the message has left the server.
+const takeThatSettlesLater = (queue: MessageQueue) =>
+  createAsyncLogic({
+    run: ({ signal }) =>
+      new Promise<string>((resolvePromise, reject) => {
+        void queue
+          .take(new AbortController().signal)
+          .then((value) => setTimeout(() => resolvePromise(value), 100));
+        signal.addEventListener('abort', () => reject(signal.reason));
+      })
+  });
+
+// An after timer fires at 4 seconds in each case.
+it.each<[string, (queue: MessageQueue) => AnyActorLogic, number]>([
+  [
+    'a take that ignores signal, offered long after the timer',
+    (queue) =>
+      takeOnly({ take: () => queue.take(new AbortController().signal) }),
+    10_000
+  ],
+  ['work after the take, offered at 3.5 seconds', takeThenSave, 3_500],
+  [
+    'a take that settles later, offered at 3.95 seconds',
+    takeThatSettlesLater,
+    3_950
+  ]
+])('loses the message to %s', async (_case, createChild, offerAt) => {
   const { queue, items } = createMessageQueue();
   const actor = createActor(
-    createTimerMachine(timers.after(takeThenSave(queue)))
+    createTimerMachine(timers.after(createChild(queue)))
   ).start();
-  await vi.advanceTimersByTimeAsync(3_500);
+  await vi.advanceTimersByTimeAsync(offerAt);
   queue.offer('config changed');
-  await vi.advanceTimersByTimeAsync(1_500);
-  expect({ ...outcome(actor), items }).toEqual({ ...kept, items: [] });
+  await vi.advanceTimersByTimeAsync(2_000);
+  expect({ ...outcome(actor), items }).toEqual(lost);
   actor.stop();
 });
 
@@ -247,13 +285,9 @@ describe('an exit in the same task', () => {
     [
       'loses the message to an event sent in the task that settles the take',
       true,
-      { value: 'retryLater', message: null, items: [] }
+      lost
     ],
-    [
-      'keeps the message when the event is sent in a later task',
-      false,
-      { value: 'retryNow', message: 'config changed', items: [] }
-    ]
+    ['keeps the message when the event is sent in a later task', false, won]
   ] as const)('%s', async (_description, sameTask, expected) => {
     const { queue, items } = createMessageQueue();
     const actor = createActor(
@@ -274,11 +308,11 @@ describe('an exit in the same task', () => {
   });
 
   it.each([
-    ['in the task that offers it', 'retryLater', true],
-    ['in a later task than the offer', 'retryNow', false]
+    ['in the task that offers it, loses the message', true, lost],
+    ['in a later task than the offer, reports the message', false, won]
   ] as const)(
-    'with a simulated clock advanced %s, reaches %s and empties the queue',
-    async (_description, expectedValue, sameTask) => {
+    'with a simulated clock advanced %s',
+    async (_description, sameTask, expected) => {
       const { queue, items } = createMessageQueue();
       const clock = new SimulatedClock();
       const actor = createActor(createRetryMachine(queue), { clock }).start();
@@ -287,8 +321,7 @@ describe('an exit in the same task', () => {
       if (sameTask) clock.increment(1);
       await vi.advanceTimersByTimeAsync(0);
       clock.increment(1);
-      expect(actor.getSnapshot().value).toBe(expectedValue);
-      expect(items).toEqual([]);
+      expect({ ...outcome(actor), items }).toEqual(expected);
       actor.stop();
     }
   );
@@ -301,82 +334,89 @@ describe('an exit in the same task', () => {
     const actor = createActor(createRetryMachine(queue)).start();
     vi.advanceTimersByTime(4_000);
     await vi.advanceTimersByTimeAsync(0);
-    expect(actor.getSnapshot().value).toBe('retryLater');
-    expect(items).toEqual([]);
+    expect({ ...outcome(actor), items }).toEqual(lost);
     actor.stop();
   });
 });
 
 describe('the documented reserve, then commit example', () => {
+  type Job = { id: string; payload: string };
+  const job: Job = { id: 'job-1', payload: 'build' };
+
   // Hides a reserved job for 10 seconds and offers it again unless the
-  // reservation is committed by then.
-  function createBroker(failCommit = false) {
-    const ready: string[] = [];
+  // reservation is committed by then. `fail` names the step that fails. A
+  // failed reserve has already hidden the job, as when the reply is lost.
+  function createBroker(fail: 'nothing' | 'reserve' | 'work' | 'commit') {
+    const ready: Job[] = [];
     const log: string[] = [];
     const expiries = new Map<string, ReturnType<typeof setTimeout>>();
-    let waiter: ((job: string) => void) | undefined;
-    const offer = (job: string) => {
+    let receipts = 0;
+    let waiter: ((next: Job) => void) | undefined;
+    const offer = (next: Job) => {
       const take = waiter;
       waiter = undefined;
-      return take ? take(job) : ready.push(job);
+      return take ? take(next) : ready.push(next);
     };
-    const reserve = (job: string) => {
+    const reserve = (next: Job) => {
+      const receipt = `receipt-${++receipts}`;
       expiries.set(
-        job,
-        setTimeout(() => offer(job), 10_000)
+        receipt,
+        setTimeout(() => offer(next), 10_000)
       );
-      return { id: job, job };
+      return fail === 'reserve'
+        ? Promise.reject(new Error('reply lost'))
+        : Promise.resolve({ receipt, job: next });
     };
     const jobs: JobQueue = {
       reserve: (signal) =>
         new Promise((resolvePromise, reject) => {
-          waiter = (job) => resolvePromise(reserve(job));
+          waiter = (next) => resolvePromise(reserve(next));
           signal.addEventListener('abort', () => {
             waiter = undefined;
             reject(signal.reason);
           });
         }),
-      commit: async (id) => {
-        if (failCommit) throw new Error('broker unavailable');
-        clearTimeout(expiries.get(id));
-        log.push(`committed ${id}`);
+      commit: async (receipt) => {
+        if (fail === 'commit') throw new Error('broker unavailable');
+        clearTimeout(expiries.get(receipt));
+        log.push(`committed ${receipt}`);
       }
     };
-    const work = async (job: string) => {
+    const work = async ({ id }: Job) => {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000));
-      log.push(`worked ${job}`);
+      if (fail === 'work') throw new Error('build failed');
+      log.push(`worked ${id}`);
     };
     return { machine: createJobMachine(jobs, work), offer, ready, log };
   }
 
+  // By 11 seconds a reservation that was not committed has expired.
   it.each([
-    [
-      'commits after the work succeeds',
-      false,
-      { value: 'done', log: ['worked build', 'committed build'], ready: [] }
-    ],
-    [
-      'stays in idle when the commit fails, and the job returns',
-      true,
-      { value: 'idle', log: ['worked build'], ready: ['build'] }
-    ]
-  ] as const)('%s', async (_description, failCommit, expected) => {
-    const broker = createBroker(failCommit);
-    const actor = createActor(broker.machine).start();
-    broker.offer('build');
-    await vi.advanceTimersByTimeAsync(11_000);
-    const { value, status } = actor.getSnapshot();
-    const { log, ready } = broker;
-    expect({ value, status, log, ready }).toEqual({
-      status: 'active',
-      ...expected
-    });
-    actor.stop();
-  });
+    ['nothing', 'done', ['worked job-1', 'committed receipt-1'], []],
+    ['reserve', 'idle', [], [job]],
+    ['work', 'idle', [], [job]],
+    ['commit', 'idle', ['worked job-1'], [job]]
+  ] as const)(
+    'when %s fails, stays active in %s, and the job returns unless committed',
+    async (fail, value, log, ready) => {
+      const broker = createBroker(fail);
+      const actor = createActor(broker.machine).start();
+      broker.offer(job);
+      await vi.advanceTimersByTimeAsync(11_000);
+      const snapshot = actor.getSnapshot();
+      expect({
+        value: snapshot.value,
+        status: snapshot.status,
+        log: broker.log,
+        ready: broker.ready
+      }).toEqual({ value, status: 'active', log, ready });
+      actor.stop();
+    }
+  );
 
   it('commits nothing when the timer exits in the task that delivers the reservation, and the job returns', async () => {
-    const broker = createBroker();
-    setTimeout(() => broker.offer('build'), 4_000);
+    const broker = createBroker('nothing');
+    setTimeout(() => broker.offer(job), 4_000);
     const actor = createActor(broker.machine).start();
     // Synchronous fake timers fire the delivery and the timer in one task.
     vi.advanceTimersByTime(4_000);
@@ -386,7 +426,7 @@ describe('the documented reserve, then commit example', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect({ log: broker.log, ready: broker.ready }).toEqual({
       log: [],
-      ready: ['build']
+      ready: [job]
     });
     actor.stop();
   });

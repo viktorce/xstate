@@ -1,16 +1,17 @@
 import { createAsyncLogic, setup } from 'xstate';
 
-type Reservation = { id: string; job: string };
+type Job = { id: string; payload: string };
+type Reservation = { receipt: string; job: Job };
 
 /** Your broker. A reservation hides the job until it is committed or expires. */
 export interface JobQueue {
   reserve(signal: AbortSignal): Promise<Reservation>;
-  commit(id: string): Promise<void>;
+  commit(receipt: string): Promise<void>;
 }
 
 export function createJobMachine(
   jobs: JobQueue,
-  work: (job: string) => Promise<void>
+  work: (job: Job) => Promise<void>
 ) {
   const reserveJob = createAsyncLogic({
     run: ({ signal }): Promise<Reservation> => jobs.reserve(signal)
@@ -19,9 +20,8 @@ export function createJobMachine(
     run: ({ input }: { input: Reservation }) => work(input.job)
   });
   const commitJob = createAsyncLogic({
-    run: ({ input }: { input: Reservation }) => jobs.commit(input.id)
+    run: ({ input }: { input: Reservation }) => jobs.commit(input.receipt)
   });
-
   return setup({ actors: { reserveJob, runJob, commitJob } }).createMachine({
     context: { reservation: null as Reservation | null },
     initial: 'waiting',
@@ -32,11 +32,11 @@ export function createJobMachine(
           onDone: ({ event }) => ({
             target: 'working',
             context: { reservation: event.output }
-          })
+          }),
+          onError: { target: 'idle' }
         },
         after: { 4_000: { target: 'idle' } }
       },
-      // A failure in either step leaves the reservation to expire.
       working: {
         invoke: {
           src: 'runJob',

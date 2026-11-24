@@ -260,15 +260,15 @@ Setting `timeout` without `onTimeout` throws when the machine is created in deve
 
 ## Racing an invocation against a timer
 
-When a timer's transition exits the invoking state before the child reports, the machine stops the child and the result never reaches `onDone`. An `after`, a state `timeout` and an invoke `timeout` each arrive as one event, and the child's completion is another. Stopping a child does not undo work it already did, such as taking a job from a queue or spending a one-time token. Nothing reports the drop as an error. An idempotent read that loses to a timer can usually be sent again. Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before retrying a write. A queue that does not redeliver never hands out a lost item again.
+When a timer's transition exits the invoking state before the child reports, the machine stops the child and the result never reaches `onDone`. An `after`, a state `timeout` and an invoke `timeout` each arrive as one event, and the child's completion is another. Stopping a child does not undo work it already did, such as taking an item from a queue or spending a one-time token. Nothing reports the drop as an error. An idempotent read that loses to a timer can usually be sent again. Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before retrying a write. A queue that does not redeliver never hands out a lost item again.
 
-Leaving the invoking state stops the child automatically. An explicit `enq.stop(children.job)`, or stopping the parent, discards an unreported result the same way. A targetless `onDone` handles the completion and stays in the state, so a later `after` or state `timeout` can exit without losing the result. Handling the completion also cancels an invoke `timeout`.
+An explicit `enq.stop` of the child, or stopping the parent, discards an unreported result the same way. A targetless `onDone` handles the completion and stays in the state, so a later `after` or state `timeout` can exit without losing the result. Handling the completion also cancels an invoke `timeout`.
 
 ### When the loss happens
 
 ```ts
 waiting: {
-  // Loses a message the child took in the cases below.
+  // Whether this loses a message depends on the child. See below.
   invoke: {
     src: 'takeMessage',
     onDone: ({ event }) => ({
@@ -282,8 +282,9 @@ waiting: {
 
 In this section a task is one event-loop callback, such as a timer firing, plus the promise callbacks that run right after it. `createActor` with the default clock delivers a timer in the task that fires it, and relays a child's completion in the task that settles it. A child that finished before the timer fired wins. The loss then needs one of these cases:
 
-- Work after the take. The child keeps working after it consumed, such as saving the item before it returns.
-- A take that settles later. The take removes the item in one task and settles its promise in a later one, such as a request to a queue server.
+- A take that ignores `signal`. The stopped child's take keeps waiting and consumes the next item, which then goes nowhere. See [rule 1](#rules-for-the-child).
+- Work after the take, such as saving the item before `run` returns.
+- A take that settles later. It removes the item in one task and settles in a later one, such as a request to a queue server.
 - An exit in the same task. An event that exits the state arrives in the task that settles the take. Advancing a [simulated clock](testing.md#control-time) or synchronous fake timers in that task counts too.
 
 The host is what runs the root actor and delivers its events. A host that queues events, such as `createEffectActor` from `@xstate/effect`, handles an event later than it was sent. A child can take an item in between, and its completion then waits behind the timer.
@@ -296,13 +297,19 @@ Pick the remedy:
 
 ### Rules for the child
 
-Here `take` is your queue's consuming call and `run` is the function passed to `createAsyncLogic`, which receives an abort signal as `signal`. A child that consumes from a queue follows three rules:
+Here `take` is your queue's consuming call and `run` is the function passed to `createAsyncLogic`, which receives an abort signal as `signal`. This child follows the three rules below:
 
-- `take` must stop waiting when `signal` aborts. Otherwise a stopped actor stays subscribed and takes the next item.
-- Once the take settles, `run` resolves with its value without awaiting anything else. Synchronous mapping is fine. Saving the item or calling another async API first is not.
-- `take` must remove the item in the same task that settles its promise. A take that settles later needs [reserve, then commit](#reserve-then-commit).
+```ts
+createAsyncLogic({
+  run: ({ signal }) => messages.take(signal)
+});
+```
 
-On `createActor` with the default clock and real timers, if a child that follows these rules finished first, its completion wins. If the timer wins, the machine stops the child, which aborts `signal`. The take withdraws, and the item stays in the queue.
+1. `take` must stop waiting when `signal` aborts.
+2. Once the take settles, `run` returns its value without awaiting anything else. Synchronous mapping is fine. To save the item, return it and save it in the next state.
+3. `take` must remove the item in the same task that settles its promise. A take that settles later needs [reserve, then commit](#reserve-then-commit).
+
+On `createActor` with the default clock and real timers, a child that follows these rules and finished first wins. If the timer wins, the machine stops the child, which aborts `signal`. The take withdraws, and the item stays in the queue.
 
 The rules do not cover an exit in the same task. With a simulated clock or synchronous fake timers, advance the clock in a later task than the one that settles the take. For any other event sent in the task that settles the take, reserve, then commit.
 
@@ -310,7 +317,7 @@ The rules do not cover an exit in the same task. With a simulated clock or synch
 
 This remedy is for hosts that queue events. On `createActor` it adds nothing beyond the rules.
 
-Async logic with a `timeout` aborts `signal` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, whatever order the host delivers events in. The deadline still loses an item to work after the take, a take that settles later or an exit in the same task. For `createEffectLogic`, see [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide. The example below assumes an in-memory queue, whose `take` removes the item in the task that settles it:
+Async logic with a `timeout` aborts `signal` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, whatever order the host delivers events in. The deadline still loses an item in each case under [when the loss happens](#when-the-loss-happens). For `createEffectLogic`, see [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide. The example below assumes an in-memory queue, whose `take` removes the item in the task that settles it:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
 ```ts
@@ -365,17 +372,18 @@ When an item must survive any exit from the state, split the take in two. The ch
 ```ts
 import { createAsyncLogic, setup } from 'xstate';
 
-type Reservation = { id: string; job: string };
+type Job = { id: string; payload: string };
+type Reservation = { receipt: string; job: Job };
 
 /** Your broker. A reservation hides the job until it is committed or expires. */
 export interface JobQueue {
   reserve(signal: AbortSignal): Promise<Reservation>;
-  commit(id: string): Promise<void>;
+  commit(receipt: string): Promise<void>;
 }
 
 export function createJobMachine(
   jobs: JobQueue,
-  work: (job: string) => Promise<void>
+  work: (job: Job) => Promise<void>
 ) {
   const reserveJob = createAsyncLogic({
     run: ({ signal }): Promise<Reservation> => jobs.reserve(signal)
@@ -384,9 +392,8 @@ export function createJobMachine(
     run: ({ input }: { input: Reservation }) => work(input.job)
   });
   const commitJob = createAsyncLogic({
-    run: ({ input }: { input: Reservation }) => jobs.commit(input.id)
+    run: ({ input }: { input: Reservation }) => jobs.commit(input.receipt)
   });
-
   return setup({ actors: { reserveJob, runJob, commitJob } }).createMachine({
     context: { reservation: null as Reservation | null },
     initial: 'waiting',
@@ -397,11 +404,11 @@ export function createJobMachine(
           onDone: ({ event }) => ({
             target: 'working',
             context: { reservation: event.output }
-          })
+          }),
+          onError: { target: 'idle' }
         },
         after: { 4_000: { target: 'idle' } }
       },
-      // A failure in either step leaves the reservation to expire.
       working: {
         invoke: {
           src: 'runJob',
@@ -425,7 +432,7 @@ export function createJobMachine(
 }
 ```
 
-A job can arrive twice. The work can finish and the commit fail, or the reservation can expire while the work runs, and the broker then offers the job again. Make the work idempotent, for example by keying its writes on the job, and reserve for longer than the work takes.
+A job can arrive twice. The work can finish and the commit fail, or the reservation can expire before the commit, and the broker then offers the job again with a new receipt. Make the work idempotent by keying its writes on the job id, not on the receipt or the payload. Reserve for longer than the work and the commit take together.
 
 ## Referencing the child
 
@@ -484,6 +491,8 @@ on: {
 ```
 
 Put the invoke on the target state instead, so the actor starts when `sending` is entered and stops when it is left.
+
+A timer that exits the invoking state stops the child and can drop a result it has not reported. See [racing an invocation against a timer](#racing-an-invocation-against-a-timer).
 
 Invoke also is not the right tool when the child must outlive the state, or when the number of children is dynamic. [Spawn](spawn.md) those instead.
 
