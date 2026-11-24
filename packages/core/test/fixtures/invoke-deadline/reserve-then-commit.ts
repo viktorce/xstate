@@ -8,28 +8,52 @@ export interface JobQueue {
   commit(id: string): Promise<void>;
 }
 
-export function createJobMachine(jobs: JobQueue) {
+export function createJobMachine(
+  jobs: JobQueue,
+  work: (job: string) => Promise<void>
+) {
   const reserveJob = createAsyncLogic({
     run: ({ signal }): Promise<Reservation> => jobs.reserve(signal)
   });
+  const runJob = createAsyncLogic({
+    run: ({ input }: { input: Reservation }) => work(input.job)
+  });
+  const commitJob = createAsyncLogic({
+    run: ({ input }: { input: Reservation }) => jobs.commit(input.id)
+  });
 
-  return setup({ actors: { reserveJob } }).createMachine({
-    context: { job: null as string | null },
+  return setup({ actors: { reserveJob, runJob, commitJob } }).createMachine({
+    context: { reservation: null as Reservation | null },
     initial: 'waiting',
     states: {
       waiting: {
         invoke: {
           src: 'reserveJob',
-          // Only this transition commits. If the timer exits first, the
-          // reservation expires and the broker offers the job again.
-          onDone: ({ event }, enq) => {
-            enq(() => jobs.commit(event.output.id));
-            return { target: 'accepted', context: { job: event.output.job } };
-          }
+          onDone: ({ event }) => ({
+            target: 'working',
+            context: { reservation: event.output }
+          })
         },
         after: { 4_000: { target: 'idle' } }
       },
-      accepted: {},
+      // A failure in either step leaves the reservation to expire.
+      working: {
+        invoke: {
+          src: 'runJob',
+          input: ({ context }) => context.reservation!,
+          onDone: { target: 'committing' },
+          onError: { target: 'idle' }
+        }
+      },
+      committing: {
+        invoke: {
+          src: 'commitJob',
+          input: ({ context }) => context.reservation!,
+          onDone: { target: 'done' },
+          onError: { target: 'idle' }
+        }
+      },
+      done: {},
       idle: {}
     }
   });

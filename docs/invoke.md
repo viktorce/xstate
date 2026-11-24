@@ -260,9 +260,9 @@ Setting `timeout` without `onTimeout` throws when the machine is created in deve
 
 ## Racing an invocation against a timer
 
-When a timer's transition exits the invoking state before the child reports, the machine stops the child and the result never reaches `onDone`. An `after`, a state `timeout` and an invoke `timeout` each arrive as one event, and the child's completion is another. Stopping a child does not undo work it already did. If the child took a job from a queue or spent a one-time token, that work is done. Nothing reports the drop as an error. An idempotent read that loses to a timer can usually be sent again. Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before retrying a write. A queue that does not redeliver never hands out a lost item again.
+When a timer's transition exits the invoking state before the child reports, the machine stops the child and the result never reaches `onDone`. An `after`, a state `timeout` and an invoke `timeout` each arrive as one event, and the child's completion is another. Stopping a child does not undo work it already did, such as taking a job from a queue or spending a one-time token. Nothing reports the drop as an error. An idempotent read that loses to a timer can usually be sent again. Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before retrying a write. A queue that does not redeliver never hands out a lost item again.
 
-Only a transition that exits the invoking state stops the child. A targetless `onDone` handles the completion and stays in the state, so an `after` or a state `timeout` can still fire afterwards and exit without losing the result. The machine cancels an invoke `timeout` when the invoked actor completes.
+Leaving the invoking state stops the child automatically. An explicit `enq.stop(children.job)`, or stopping the parent, discards an unreported result the same way. A targetless `onDone` handles the completion and stays in the state, so a later `after` or state `timeout` can exit without losing the result. Handling the completion also cancels an invoke `timeout`.
 
 ### When the loss happens
 
@@ -286,13 +286,17 @@ In this section a task is one event-loop callback, such as a timer firing, plus 
 - A take that settles later. The take removes the item in one task and settles its promise in a later one, such as a request to a queue server.
 - An exit in the same task. An event that exits the state arrives in the task that settles the take. Advancing a [simulated clock](testing.md#control-time) or synchronous fake timers in that task counts too.
 
-A host that queues events, such as `createEffectActor` from `@xstate/effect`, handles an event later than it was sent. A child can take an item in between, and its completion then waits behind the timer.
+The host is what runs the root actor and delivers its events. A host that queues events, such as `createEffectActor` from `@xstate/effect`, handles an event later than it was sent. A child can take an item in between, and its completion then waits behind the timer.
 
-Pick the remedy by host and queue. On `createActor` with the default clock and real timers, a child that follows the [rules for the child](#rules-for-the-child) keeps its result, and a plain `after` is fine. On a host that queues events, a [deadline inside the logic](#a-deadline-inside-the-logic) replaces the machine timer. For a queue reached over a network, or an event that can exit the state in the task that settles the take, [reserve, then commit](#reserve-then-commit). On a host that queues events this includes any other event that exits the state.
+Pick the remedy:
+
+- `createActor` with the default clock, real timers and an in-memory queue. Follow the [rules for the child](#rules-for-the-child) and keep a plain `after`.
+- A host that queues events. Use a [deadline inside the logic](#a-deadline-inside-the-logic) instead of a machine timer. If any other event can exit the state, [reserve, then commit](#reserve-then-commit).
+- A queue reached over a network, or an event that can exit the state in the task that settles the take. [Reserve, then commit](#reserve-then-commit).
 
 ### Rules for the child
 
-In these rules, `take` is your queue's consuming call and `run` is the function passed to `createAsyncLogic`, which receives an abort signal as `signal`. A child that consumes from a queue follows three rules:
+Here `take` is your queue's consuming call and `run` is the function passed to `createAsyncLogic`, which receives an abort signal as `signal`. A child that consumes from a queue follows three rules:
 
 - `take` must stop waiting when `signal` aborts. Otherwise a stopped actor stays subscribed and takes the next item.
 - Once the take settles, `run` resolves with its value without awaiting anything else. Synchronous mapping is fine. Saving the item or calling another async API first is not.
@@ -304,9 +308,9 @@ The rules do not cover an exit in the same task. With a simulated clock or synch
 
 ### A deadline inside the logic
 
-Async logic with a `timeout` aborts `signal` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, whatever order the host delivers events in. On `createActor` this adds nothing beyond the rules.
+This remedy is for hosts that queue events. On `createActor` it adds nothing beyond the rules.
 
-On every host, the deadline still loses an item to work after the take, a take that settles later or an exit in the same task. For `createEffectLogic`, see [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide. The example assumes an in-memory queue, whose `take` removes the item in the task that settles it:
+Async logic with a `timeout` aborts `signal` when the time is up, and only then errors with a `TimeoutError`. One actor then decides between the two outcomes, whatever order the host delivers events in. The deadline still loses an item to work after the take, a take that settles later or an exit in the same task. For `createEffectLogic`, see [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide. The example below assumes an in-memory queue, whose `take` removes the item in the task that settles it:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
 ```ts
@@ -355,7 +359,7 @@ A deadline inside the logic behaves differently across persistence. With the def
 
 ### Reserve, then commit
 
-When an item must survive any exit from the state, split the take in two. The child reserves the item and returns the reservation, and `onDone` commits it. If the machine exits the state first, nothing commits, and the queue makes the item available again when the reservation expires. The item can then arrive twice, so handle it idempotently. Most brokers already offer this as a visibility timeout or an acknowledgement. The queue holds the item until the commit, so this also covers a take that settles later and an exit in the same task. A plain `after` on the same state is then safe:
+When an item must survive any exit from the state, split the take in two. The child reserves the item, the machine does the work, and only then commits the reservation. Until the commit, the queue holds the item and offers it again when the reservation expires. Most brokers offer this as a visibility timeout or an acknowledgement. This also covers a take that settles later and an exit in the same task, so a plain `after` on the same state is safe:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/reserve-then-commit.ts -->
 ```ts
@@ -369,35 +373,59 @@ export interface JobQueue {
   commit(id: string): Promise<void>;
 }
 
-export function createJobMachine(jobs: JobQueue) {
+export function createJobMachine(
+  jobs: JobQueue,
+  work: (job: string) => Promise<void>
+) {
   const reserveJob = createAsyncLogic({
     run: ({ signal }): Promise<Reservation> => jobs.reserve(signal)
   });
+  const runJob = createAsyncLogic({
+    run: ({ input }: { input: Reservation }) => work(input.job)
+  });
+  const commitJob = createAsyncLogic({
+    run: ({ input }: { input: Reservation }) => jobs.commit(input.id)
+  });
 
-  return setup({ actors: { reserveJob } }).createMachine({
-    context: { job: null as string | null },
+  return setup({ actors: { reserveJob, runJob, commitJob } }).createMachine({
+    context: { reservation: null as Reservation | null },
     initial: 'waiting',
     states: {
       waiting: {
         invoke: {
           src: 'reserveJob',
-          // Only this transition commits. If the timer exits first, the
-          // reservation expires and the broker offers the job again.
-          onDone: ({ event }, enq) => {
-            enq(() => jobs.commit(event.output.id));
-            return { target: 'accepted', context: { job: event.output.job } };
-          }
+          onDone: ({ event }) => ({
+            target: 'working',
+            context: { reservation: event.output }
+          })
         },
         after: { 4_000: { target: 'idle' } }
       },
-      accepted: {},
+      // A failure in either step leaves the reservation to expire.
+      working: {
+        invoke: {
+          src: 'runJob',
+          input: ({ context }) => context.reservation!,
+          onDone: { target: 'committing' },
+          onError: { target: 'idle' }
+        }
+      },
+      committing: {
+        invoke: {
+          src: 'commitJob',
+          input: ({ context }) => context.reservation!,
+          onDone: { target: 'done' },
+          onError: { target: 'idle' }
+        }
+      },
+      done: {},
       idle: {}
     }
   });
 }
 ```
 
-Committing in `onDone` is safe when that transition finishes the work or hands it off durably. If work after the commit fails, the queue does not redeliver the job, so commit after that work instead.
+A job can arrive twice. The work can finish and the commit fail, or the reservation can expire while the work runs, and the broker then offers the job again. Make the work idempotent, for example by keying its writes on the job, and reserve for longer than the work takes.
 
 ## Referencing the child
 
