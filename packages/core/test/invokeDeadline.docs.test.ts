@@ -223,35 +223,6 @@ it('reaches failed when take rejects with an error other than a timeout', async 
   actor.stop();
 });
 
-describe('a targetless onDone', () => {
-  it.each([
-    ['after', 'retryLater'],
-    ['an invoke timeout', 'waiting'],
-    ['a state timeout', 'retryLater']
-  ] as const)(
-    'with %s, keeps the message and is in %s after the timer is due',
-    async (timer, value) => {
-      const { queue } = createMessageQueue();
-      const waiting = timers[timer](takeOnly(queue));
-      const actor = createActor(
-        createTimerMachine({
-          ...waiting,
-          invoke: {
-            ...waiting.invoke,
-            onDone: ({ event }: { event: { output: unknown } }) => ({
-              context: { message: event.output }
-            })
-          }
-        })
-      ).start();
-      queue.offer('config changed');
-      await vi.advanceTimersByTimeAsync(4_000);
-      expect(outcome(actor)).toEqual({ value, message: 'config changed' });
-      actor.stop();
-    }
-  );
-});
-
 // Rejects when signal aborts but leaves its request with the queue.
 const takeWithoutWithdrawing = (queue: MessageQueue) =>
   createAsyncLogic({

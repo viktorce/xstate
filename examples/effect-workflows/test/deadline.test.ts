@@ -56,6 +56,7 @@ it.each([
         Effect.provideService(Clock.Clock, clock)
       );
       for (let i = 0; i < 100 && !wakeDeadline; i++) yield* Effect.yieldNow;
+      expect(wakeDeadline).toBeDefined();
       const deliver = () => {
         Queue.offerUnsafe(messages, 'config changed');
         Queue.flushUnsafe(messages);

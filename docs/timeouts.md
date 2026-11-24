@@ -21,7 +21,7 @@ The timer starts when the state is entered and is canceled when the state is exi
 
 `onTimeout` is required whenever a state declares a `timeout`. In development builds, a machine declaring `timeout` without `onTimeout` throws when it is created. An `onTimeout` without a `timeout` does not schedule a timer.
 
-If `onTimeout` exits the state while an invoked child is still working, the machine stops the child and loses a result it has not reported. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
+If `onTimeout` exits the state before an invoked child reports, the machine stops the child and loses a result it has not reported. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
 
 `timeout` and [`after`](delays.md) are independent timers and can be used on the same state. `after` schedules a transition at a point in time; `timeout` expresses a deadline for the work the state represents.
 
