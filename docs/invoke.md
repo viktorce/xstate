@@ -268,9 +268,9 @@ An explicit `enq.stop` of the child also loses a result the child has not sent y
 
 Use the first entry that fits:
 
-- Your queue is on another server, your take cannot be withdrawn, or the take can settle in the same turn that exits the state, as with a simulated clock. Use [reserve, then commit](#reserve-then-commit).
+- Your queue is on another server, your take cannot be withdrawn, or the take can settle in the same [turn](#when-the-loss-happens) that exits the state, as with a simulated clock. Use [reserve, then commit](#reserve-then-commit).
 - Your host queues events, as `createEffectActor` does. Follow the [rules for the child](#rules-for-the-child) and move the [deadline inside the logic](#a-deadline-inside-the-logic). If any other event can exit the state, use reserve, then commit.
-- You run `createActor`, the [built-in runtime](durable-execution.md#driving-effects-yourself), with the default clock, real timers and an in-memory queue. Follow the rules for the child and keep the machine timer.
+- You run `createActor`, the [built-in runtime](durable-execution.md#driving-effects-yourself), with the default clock, real timers and an in-memory queue, and nothing settles the take in the turn that exits the state. Follow the rules for the child and keep the machine timer.
 
 Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before you retry work whose result was lost.
 
