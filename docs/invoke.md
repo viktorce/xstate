@@ -266,11 +266,13 @@ An explicit `enq.stop` of the child also loses a result the child has not sent y
 
 ### Pick a remedy
 
-Use the first entry that fits:
+A turn is one event-loop callback, such as a timer firing, plus the promise callbacks that run after it. Use the first entry that fits:
 
-- Your queue is on another server, your take cannot be withdrawn, or the take can settle in the same [turn](#when-the-loss-happens) that exits the state, as with a simulated clock. Use [reserve, then commit](#reserve-then-commit).
-- Your host queues events, as `createEffectActor` does. Follow the [rules for the child](#rules-for-the-child) and move the [deadline inside the logic](#a-deadline-inside-the-logic). If any other event can exit the state, use reserve, then commit.
+- Your queue is on another server, your take cannot be withdrawn, or the take can settle in the turn that exits the state, as when the code that offers the item also sends an event that exits the state. Use [reserve, then commit](#reserve-then-commit).
+- Your host queues the root actor's events, as `createEffectActor` does. Nested machines get theirs directly. Follow the [rules for the child](#rules-for-the-child) and move the [deadline inside the logic](#a-deadline-inside-the-logic). For a `createEffectLogic` child, follow [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide instead. If any other event can exit the state, use reserve, then commit.
 - You run `createActor`, the [built-in runtime](durable-execution.md#driving-effects-yourself), with the default clock, real timers and an in-memory queue, and nothing settles the take in the turn that exits the state. Follow the rules for the child and keep the machine timer.
+
+If only a simulated clock or synchronous fake timers lose the item, see the [note under the rules](#rules-for-the-child).
 
 Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before you retry work whose result was lost.
 
@@ -290,12 +292,12 @@ waiting: {
 }
 ```
 
-A turn is one event-loop callback, such as a timer firing, plus the promise callbacks that run after it. With the default clock, the built-in runtime delivers a timer in the turn that fires it, and a child's completion in the turn its `run` promise settles. A child that finished before the timer fired wins. In that setup, a loss needs one of these cases:
+With the default clock, the built-in runtime delivers a timer in the turn that fires it, and a child's completion in the turn its `run` promise settles. A child that finished before the timer fired wins. In that setup, a loss needs one of these cases:
 
 - A take that registers or keeps a request after `signal` aborted. See [rule 1](#rules-for-the-child). The request consumes the next item.
 - Asynchronous work after the take, such as saving the item before `run` returns.
 - A take that settles later. It removes the item in one turn and settles in a later one, such as a request to a queue server.
-- An exit in the same turn. The take settles in the turn that exits the state. That happens when code offers the item and sends an event that exits the state in the same turn, when an `exit` action of the state offers the item before the child stops, or when advancing a [simulated clock](testing.md#control-time) or synchronous fake timers fires the timer.
+- An exit in the same turn. The take settles in the turn that exits the state. That happens when code offers the item and sends an event that exits the state in the same turn, when an `exit` action that runs before the child stops offers the item, or when advancing a [simulated clock](testing.md#control-time) or synchronous fake timers fires the timer.
 
 A host runs the root actor and delivers its events. One that queues events, such as `createEffectActor`, handles an event later than it was sent. A child can take an item in between, and its completion waits behind the timer.
 
@@ -319,7 +321,7 @@ The rules do not cover an exit in the same turn. With a simulated clock or synch
 
 ### A deadline inside the logic
 
-Async logic with a `timeout` aborts `signal` at the deadline, and only then errors with a `TimeoutError`. The child picks one outcome itself, and no machine timer races its completion. The four cases under [when the loss happens](#when-the-loss-happens) still apply. For `createEffectLogic`, see [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide. The example assumes an in-memory queue that follows rules 1 and 3:
+Async logic with a `timeout` aborts `signal` at the deadline, and only then errors with a `TimeoutError`. The child picks one outcome itself, and no machine timer races its completion. The four cases under [when the loss happens](#when-the-loss-happens) still apply. The same-turn case applies to the turn that fires the deadline, so advance a simulated clock or synchronous fake timers after the turn that settles the take. The example assumes an in-memory queue that follows rules 1 and 3:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
 ```ts
@@ -371,7 +373,7 @@ On restore, an `after` timer keeps its [original deadline](persistence.md#preser
 
 ### Reserve, then commit
 
-When an item must survive any exit from the state, split the take into a reserve and a commit, with the work between them. The example assumes a broker that offers an uncommitted item again when its reservation expires, as a visibility timeout does. With manual acknowledgements, find out what returns an abandoned reservation. This also covers a take that settles later and an exit in the same turn, so a plain `after` is safe:
+When an item must survive any exit from the state, split the take into a reserve and a commit, with the work between them. The example assumes a broker that offers an uncommitted item again when its reservation expires, as a visibility timeout does. With manual acknowledgements, find out what returns an abandoned reservation. This also covers a take that settles later and an exit in the same turn. A plain `after` does not lose the job. A job abandoned this way returns when its reservation expires:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/reserve-then-commit.ts -->
 ```ts
