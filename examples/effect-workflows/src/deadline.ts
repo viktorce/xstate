@@ -27,14 +27,16 @@ const nextSignal = createEffectLogic(
 export const retryMachine = setupEffect({
   actors: { nextSignal }
 }).createMachine({
+  context: { signal: null as string | null },
   initial: 'waiting',
   states: {
     waiting: {
       invoke: {
         src: 'nextSignal',
-        onDone: ({ event }) => ({
-          target: event.output.kind === 'signal' ? 'retryNow' : 'retryLater'
-        })
+        onDone: ({ event }) =>
+          event.output.kind === 'signal'
+            ? { target: 'retryNow', context: { signal: event.output.signal } }
+            : { target: 'retryLater' }
       }
     },
     retryNow: { type: 'final' },
@@ -48,9 +50,9 @@ const program = Effect.gen(function* () {
     Effect.provideService(Signals, signals)
   );
   yield* Queue.offer(signals, 'config changed');
-  const snapshot = yield* waitFor(actor, (s) => s.status === 'done');
-  return snapshot.value;
+  const { value, context } = yield* waitFor(actor, (s) => s.status === 'done');
+  return { value, signal: context.signal };
 });
 
 export const result = await Effect.runPromise(Effect.scoped(program));
-console.log(result); // 'retryNow'
+console.log(result); // { value: 'retryNow', signal: 'config changed' }
