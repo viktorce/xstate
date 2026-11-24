@@ -531,8 +531,10 @@ describe('the core deadline example under createEffectActor', () => {
     });
   });
 
-  // Pins that TestClock moves only Effect's Clock, not the global timers. An
-  // Effect upgrade may change it without anything being wrong in this package.
+  // Pins that TestClock moves only Effect's Clock, not the global timers.
+  // Async logic arms its timeout with `system._clock.setTimeout` in
+  // packages/core/src/actors/promise.ts, and the Effect host's `scheduleTimer`
+  // never sees it, so only a change in core or in the host can move it.
   // Delete this test and the guide sentence about TestClock when this timeout
   // moves to the Effect clock.
   it('runs an async logic timeout on the global timers, not on TestClock', async () => {
