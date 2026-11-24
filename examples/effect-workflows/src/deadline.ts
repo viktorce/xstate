@@ -6,18 +6,18 @@ import {
   waitFor
 } from '@xstate/effect';
 
-export class Signals extends Context.Service<Signals, Queue.Queue<string>>()(
-  '@app/Signals'
+export class Messages extends Context.Service<Messages, Queue.Queue<string>>()(
+  '@app/Messages'
 ) {}
 
 // One Effect owns both outcomes. The take branch holds only the take and one
 // Effect.map, so it finishes in the step that removes the item. When the
 // deadline wins, the race interrupts the take before it removes anything.
-const nextSignal = createEffectLogic(
-  Signals.use((signals) =>
+const nextMessage = createEffectLogic(
+  Messages.use((messages) =>
     Effect.raceFirst(
-      Queue.take(signals).pipe(
-        Effect.map((signal) => ({ kind: 'signal' as const, signal }))
+      Queue.take(messages).pipe(
+        Effect.map((message) => ({ kind: 'message' as const, message }))
       ),
       Effect.sleep('4 seconds').pipe(Effect.as({ kind: 'deadline' as const }))
     )
@@ -25,17 +25,17 @@ const nextSignal = createEffectLogic(
 );
 
 export const retryMachine = setupEffect({
-  actors: { nextSignal }
+  actors: { nextMessage }
 }).createMachine({
-  context: { signal: null as string | null },
+  context: { message: null as string | null },
   initial: 'waiting',
   states: {
     waiting: {
       invoke: {
-        src: 'nextSignal',
+        src: 'nextMessage',
         onDone: ({ event }) =>
-          event.output.kind === 'signal'
-            ? { target: 'retryNow', context: { signal: event.output.signal } }
+          event.output.kind === 'message'
+            ? { target: 'retryNow', context: { message: event.output.message } }
             : { target: 'retryLater' }
       }
     },
@@ -45,14 +45,14 @@ export const retryMachine = setupEffect({
 });
 
 const program = Effect.gen(function* () {
-  const signals = yield* Queue.unbounded<string>();
+  const messages = yield* Queue.unbounded<string>();
   const actor = yield* createEffectActor(retryMachine).pipe(
-    Effect.provideService(Signals, signals)
+    Effect.provideService(Messages, messages)
   );
-  yield* Queue.offer(signals, 'config changed');
+  yield* Queue.offer(messages, 'config changed');
   const { value, context } = yield* waitFor(actor, (s) => s.status === 'done');
-  return { value, signal: context.signal };
+  return { value, message: context.message };
 });
 
 export const result = await Effect.runPromise(Effect.scoped(program));
-console.log(result); // { value: 'retryNow', signal: 'config changed' }
+console.log(result); // { value: 'retryNow', message: 'config changed' }

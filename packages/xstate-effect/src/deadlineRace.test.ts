@@ -1,7 +1,11 @@
 import { Clock, Context, Duration, Effect, Option, Queue, Scope } from 'effect';
 import { TestClock } from 'effect/testing';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createAsyncLogic, createMachine, TimeoutError } from 'xstate';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AnyStateMachine } from 'xstate';
+import {
+  createRetryMachine as createAsyncRetryMachine,
+  type MessageQueue
+} from '../../core/test/fixtures/invoke-deadline/take-or-deadline.ts';
 import {
   createEffectActor,
   createEffectLogic,
@@ -10,31 +14,35 @@ import {
   type EffectActor
 } from './index.ts';
 
-class Signals extends Context.Service<Signals, Queue.Queue<string>>()(
-  '@test/Signals'
+class Messages extends Context.Service<Messages, Queue.Queue<string>>()(
+  '@test/Messages'
 ) {}
 
-type Outcome = { kind: 'signal'; signal: string } | { kind: 'deadline' };
+type Outcome = { kind: 'message'; message: string } | { kind: 'deadline' };
 
-const toSignal = (signal: string) => ({ kind: 'signal' as const, signal });
+const toMessage = (message: string) => ({ kind: 'message' as const, message });
 
 // The machine from examples/effect-workflows/src/deadline.ts and, for the
 // pattern the docs warn about, an `after` timer.
 function createRetryMachine(
-  task: Effect.Effect<Outcome, never, Signals>,
+  task: Effect.Effect<Outcome, never, Messages>,
   timer?: 'after'
 ) {
-  const nextSignal = createEffectLogic(task);
-  return setupEffect({ actors: { nextSignal } }).createMachine({
-    context: { signal: null as string | null },
+  const nextMessage = createEffectLogic(task);
+  return setupEffect({ actors: { nextMessage } }).createMachine({
+    context: { message: null as string | null },
     initial: 'waiting',
+    output: ({ context }) => context,
     states: {
       waiting: {
         invoke: {
-          src: 'nextSignal',
+          src: 'nextMessage',
           onDone: ({ event }) =>
-            event.output.kind === 'signal'
-              ? { target: 'retryNow', context: { signal: event.output.signal } }
+            event.output.kind === 'message'
+              ? {
+                  target: 'retryNow',
+                  context: { message: event.output.message }
+                }
               : { target: 'retryLater' }
         },
         after: timer ? { 4_000: { target: 'retryLater' } } : {}
@@ -45,37 +53,76 @@ function createRetryMachine(
   });
 }
 
-const takeSignal = (signals: Queue.Queue<string>) =>
-  Queue.take(signals).pipe(Effect.map(toSignal));
+// A root machine that runs `child` as a nested machine and copies its result.
+function createParentMachine(child: AnyStateMachine) {
+  return setupEffect({ actors: { child } }).createMachine({
+    context: { message: null as string | null },
+    initial: 'waiting',
+    states: {
+      waiting: {
+        invoke: {
+          src: 'child',
+          onDone: ({ event }) => ({
+            target: event.output.message ? 'retryNow' : 'retryLater',
+            context: { message: event.output.message }
+          })
+        }
+      },
+      retryNow: { type: 'final' },
+      retryLater: { type: 'final' }
+    }
+  });
+}
 
-const raceFirst = (branch = takeSignal) =>
+const takeMessage = (messages: Queue.Queue<string>) =>
+  Queue.take(messages).pipe(Effect.map(toMessage));
+
+const raceFirst = (branch = takeMessage) =>
   createRetryMachine(
-    Signals.use((signals) =>
+    Messages.use((messages) =>
       Effect.raceFirst(
-        branch(signals),
+        branch(messages),
         Effect.sleep('4 seconds').pipe(Effect.as({ kind: 'deadline' as const }))
       )
     )
   );
 
 const timeoutOption = createRetryMachine(
-  Signals.use((signals) =>
-    Queue.take(signals).pipe(
+  Messages.use((messages) =>
+    Queue.take(messages).pipe(
       Effect.timeoutOption('4 seconds'),
       Effect.map(
         Option.match({
           onNone: () => ({ kind: 'deadline' as const }),
-          onSome: toSignal
+          onSome: toMessage
         })
       )
     )
   )
 );
 
+const afterTimer = createRetryMachine(Messages.use(takeMessage), 'after');
+
 const machines = {
   'Effect.raceFirst': raceFirst(),
+  'Effect.raceFirst and Effect.yieldNow after the take': raceFirst((messages) =>
+    Queue.take(messages).pipe(
+      Effect.tap(() => Effect.yieldNow),
+      Effect.map(toMessage)
+    )
+  ),
+  // The task saves the message for a second after the take.
+  'Effect.raceFirst and an asynchronous save after the take': raceFirst(
+    (messages) =>
+      Queue.take(messages).pipe(
+        Effect.flatMap((message) =>
+          Effect.sleep('1 second').pipe(Effect.as(toMessage(message)))
+        )
+      )
+  ),
   'Effect.timeoutOption': timeoutOption,
-  'an `after` timer': createRetryMachine(Signals.use(takeSignal), 'after')
+  'an `after` timer': afterTimer,
+  'an `after` timer in a nested machine': createParentMachine(afterTimer)
 };
 
 /**
@@ -119,14 +166,14 @@ function createManualClock(clock: Clock.Clock) {
 function run<A, E>(
   effect: (
     manual: ReturnType<typeof createManualClock>
-  ) => Effect.Effect<A, E, Signals | Scope.Scope>
+  ) => Effect.Effect<A, E, Messages | Scope.Scope>
 ) {
   return Effect.runPromise(
     Effect.gen(function* () {
-      const signals = yield* Queue.unbounded<string>();
+      const messages = yield* Queue.unbounded<string>();
       const manual = createManualClock(yield* Clock.Clock);
       return yield* effect(manual).pipe(
-        Effect.provideService(Signals, signals),
+        Effect.provideService(Messages, messages),
         Effect.provideService(Clock.Clock, manual.clock)
       );
     }).pipe(
@@ -139,107 +186,102 @@ function run<A, E>(
 }
 
 const outcome = (
-  actor: EffectActor<ReturnType<typeof createRetryMachine>>,
-  signals: Queue.Queue<string>
+  actor: EffectActor<AnyStateMachine>,
+  messages: Queue.Queue<string>
 ) =>
   Effect.gen(function* () {
     const { value, context } = yield* waitFor(
       actor,
       (s) => s.status === 'done'
     );
-    return { value, signal: context.signal, size: yield* Queue.size(signals) };
+    return {
+      value,
+      message: context.message,
+      size: yield* Queue.size(messages)
+    };
   });
 
 // `Queue.offerUnsafe` wakes a waiting take on a later scheduler step.
 // `Queue.flushUnsafe` wakes it at once, so the take removes the item in the
 // same step.
-const offerAndTake = (signals: Queue.Queue<string>) => {
-  Queue.offerUnsafe(signals, 'config changed');
-  Queue.flushUnsafe(signals);
+const offerAndTake = (messages: Queue.Queue<string>) => {
+  Queue.offerUnsafe(messages, 'config changed');
+  Queue.flushUnsafe(messages);
 };
 
 // Each schedule runs in one synchronous step, with nothing in between.
+type Schedule = (messages: Queue.Queue<string>, wake: () => void) => void;
 const schedules = {
-  'taken before the timer ends': (
-    signals: Queue.Queue<string>,
-    wake: () => void
-  ) => {
-    offerAndTake(signals);
+  'offered to the waiting take before the timer ends': (messages, wake) => {
+    offerAndTake(messages);
     wake();
   },
-  'offered before the timer ends and taken after': (
-    signals: Queue.Queue<string>,
-    wake: () => void
-  ) => {
-    Queue.offerUnsafe(signals, 'config changed');
+  'offered before the timer ends': (messages, wake) => {
+    Queue.offerUnsafe(messages, 'config changed');
     wake();
   },
-  'offered and taken after the timer ends': (
-    signals: Queue.Queue<string>,
-    wake: () => void
-  ) => {
+  'offered after the timer ends': (messages, wake) => {
     wake();
-    offerAndTake(signals);
+    offerAndTake(messages);
   }
-};
+} satisfies Record<string, Schedule>;
 
-// Either winner is valid at a tie. Taking the signal and then reporting the
+// Either winner is valid at a tie. Taking the message and then reporting the
 // deadline is not, and neither is an `after` timer that drops it.
 const outcomes = {
-  'reports the signal': {
-    value: 'retryNow',
-    signal: 'config changed',
-    size: 0
-  },
-  'keeps the signal in the queue': {
-    value: 'retryLater',
-    signal: null,
-    size: 1
-  },
-  'loses the signal': { value: 'retryLater', signal: null, size: 0 }
+  'reports it': { value: 'retryNow', message: 'config changed', size: 0 },
+  'keeps it queued': { value: 'retryLater', message: null, size: 1 },
+  'loses it': { value: 'retryLater', message: null, size: 0 }
 };
 
-describe('a signal that arrives at the instant the timer ends', () => {
+describe('a message that arrives at the instant the timer ends', () => {
   it.each([
-    ['Effect.raceFirst', 'taken before the timer ends', 'reports the signal'],
     [
       'Effect.raceFirst',
-      'offered before the timer ends and taken after',
-      'keeps the signal in the queue'
+      'offered to the waiting take before the timer ends',
+      'reports it'
+    ],
+    ['Effect.raceFirst', 'offered before the timer ends', 'keeps it queued'],
+    ['Effect.raceFirst', 'offered after the timer ends', 'keeps it queued'],
+    [
+      'Effect.raceFirst and Effect.yieldNow after the take',
+      'offered to the waiting take before the timer ends',
+      'loses it'
     ],
     [
-      'Effect.raceFirst',
-      'offered and taken after the timer ends',
-      'keeps the signal in the queue'
+      'Effect.raceFirst and an asynchronous save after the take',
+      'offered to the waiting take before the timer ends',
+      'loses it'
     ],
     [
       'Effect.timeoutOption',
-      'offered before the timer ends and taken after',
-      'keeps the signal in the queue'
-    ],
-    ['an `after` timer', 'taken before the timer ends', 'reports the signal'],
-    [
-      'an `after` timer',
-      'offered before the timer ends and taken after',
-      'loses the signal'
+      'offered before the timer ends',
+      'keeps it queued'
     ],
     [
       'an `after` timer',
-      'offered and taken after the timer ends',
-      'loses the signal'
+      'offered to the waiting take before the timer ends',
+      'reports it'
+    ],
+    ['an `after` timer', 'offered before the timer ends', 'loses it'],
+    ['an `after` timer', 'offered after the timer ends', 'loses it'],
+    [
+      'an `after` timer in a nested machine',
+      'offered before the timer ends',
+      'keeps it queued'
     ]
   ] as const)(
-    'with %s, when the signal is %s, %s',
+    'with %s, when the message is %s, %s',
     async (timer, schedule, expected) => {
       const result = await run(({ started, wake }) =>
         Effect.gen(function* () {
-          const signals = yield* Signals;
+          const messages = yield* Messages;
           const actor = yield* createEffectActor(machines[timer]);
           yield* started(4_000);
           yield* Effect.sync(() =>
-            schedules[schedule](signals, () => wake(4_000))
+            schedules[schedule](messages, () => wake(4_000))
           );
-          return yield* outcome(actor, signals);
+          return yield* outcome(actor, messages);
         })
       );
       expect(result).toEqual(outcomes[expected]);
@@ -247,66 +289,25 @@ describe('a signal that arrives at the instant the timer ends', () => {
   );
 });
 
-it('loses the signal to the deadline inside a task that keeps working after the take', async () => {
-  // The task saves the signal for a second after the take.
-  const machine = raceFirst((signals) =>
-    Queue.take(signals).pipe(
-      Effect.flatMap((signal) =>
-        Effect.sleep('1 second').pipe(Effect.as(toSignal(signal)))
-      )
-    )
-  );
-  const result = await run(({ started, wake }) =>
-    Effect.gen(function* () {
-      const signals = yield* Signals;
-      const actor = yield* createEffectActor(machine);
-      yield* started(4_000);
-      offerAndTake(signals);
-      yield* started(1_000);
-      wake(4_000);
-      return yield* outcome(actor, signals);
-    })
-  );
-  expect(result).toEqual(outcomes['loses the signal']);
-});
-
-// Core async logic under createEffectActor, with a take that is withdrawn
-// when its abort signal aborts.
-describe('core async logic under createEffectActor', () => {
-  function createTimeoutMachine() {
+// The documented core deadline example under createEffectActor, with a take
+// that is withdrawn when its abort signal aborts.
+describe('the core deadline example under createEffectActor', () => {
+  function createRetryActorLogic() {
     const items: string[] = [];
     let waiter: ((value: string) => void) | undefined;
+    const queue: MessageQueue = {
+      take: (signal) =>
+        new Promise((resolvePromise, reject) => {
+          waiter = resolvePromise;
+          signal.addEventListener('abort', () => {
+            waiter = undefined;
+            reject(signal.reason);
+          });
+        })
+    };
     const offer = (value: string) =>
       waiter ? waiter(value) : items.push(value);
-    const machine = createMachine({
-      initial: 'waiting',
-      states: {
-        waiting: {
-          invoke: {
-            src: createAsyncLogic({
-              timeout: 4_000,
-              run: ({ signal }) =>
-                new Promise<string>((resolvePromise, reject) => {
-                  waiter = resolvePromise;
-                  signal.addEventListener('abort', () => {
-                    waiter = undefined;
-                    reject(signal.reason);
-                  });
-                })
-            }),
-            onDone: { target: 'retryNow' },
-            onError: ({ event }) => ({
-              target:
-                event.error instanceof TimeoutError ? 'retryLater' : 'failed'
-            })
-          }
-        },
-        retryNow: { type: 'final' },
-        retryLater: { type: 'final' },
-        failed: { type: 'final' }
-      }
-    });
-    return { machine, items, offer };
+    return { machine: createAsyncRetryMachine(queue), items, offer };
   }
 
   // Async logic arms its own timeout on the global setTimeout, which vitest
@@ -326,11 +327,14 @@ describe('core async logic under createEffectActor', () => {
     for (let i = 0; i < 100 && vi.getTimerCount() === 0; i++) {
       yield* Effect.yieldNow;
     }
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
   });
 
-  it('keeps a message that arrives before the machine handles an async logic timeout', async () => {
-    const { machine, items, offer } = createTimeoutMachine();
+  const settled = (actor: EffectActor<AnyStateMachine>) =>
+    waitFor(actor, (s) => s.value !== 'waiting');
+
+  it('keeps a message that arrives before the machine handles the timeout', async () => {
+    const { machine, items, offer } = createRetryActorLogic();
     const result = await run(() =>
       Effect.gen(function* () {
         const actor = yield* createEffectActor(machine);
@@ -344,24 +348,49 @@ describe('core async logic under createEffectActor', () => {
         // Both timers fire in one task, so the message arrives after the
         // deadline aborted the take and before the machine handles it.
         vi.advanceTimersByTime(4_000);
-        const snapshot = yield* waitFor(actor, (s) => s.status === 'done');
-        return { value: snapshot.value, valueAtOffer };
+        const { value } = yield* settled(actor);
+        return { value, valueAtOffer };
       })
     );
     expect(result).toEqual({ value: 'retryLater', valueAtOffer: 'waiting' });
     expect(items).toEqual(['config changed']);
   });
 
+  it('reports a message the take returned before the deadline, though the machine handles it after', async () => {
+    const { machine, offer } = createRetryActorLogic();
+    const result = await run(() =>
+      Effect.gen(function* () {
+        const actor = yield* createEffectActor(machine);
+        yield* armed;
+        const valueAtDeadline = yield* Effect.promise(async () => {
+          vi.advanceTimersByTime(3_999);
+          offer('config changed');
+          // The take settles in these microtasks, before Effect's next step.
+          for (let i = 0; i < 10; i++) await Promise.resolve();
+          vi.advanceTimersByTime(1);
+          return actor.getSnapshot().value;
+        });
+        const { value, context } = yield* settled(actor);
+        return { valueAtDeadline, value, message: context.message };
+      })
+    );
+    expect(result).toEqual({
+      valueAtDeadline: 'waiting',
+      value: 'retryNow',
+      message: 'config changed'
+    });
+  });
+
   it('runs an async logic timeout on the global timers, not on TestClock', async () => {
     const values = await Effect.runPromise(
       Effect.gen(function* () {
-        const actor = yield* createEffectActor(createTimeoutMachine().machine);
+        const actor = yield* createEffectActor(createRetryActorLogic().machine);
         yield* armed;
         yield* TestClock.adjust('5 seconds');
         for (let i = 0; i < 10; i++) yield* Effect.yieldNow;
         const afterTestClock = actor.getSnapshot().value;
         vi.advanceTimersByTime(4_000);
-        const snapshot = yield* waitFor(actor, (s) => s.status === 'done');
+        const snapshot = yield* settled(actor);
         return [afterTestClock, snapshot.value];
       }).pipe(Effect.scoped, Effect.provide(TestClock.layer()))
     );
