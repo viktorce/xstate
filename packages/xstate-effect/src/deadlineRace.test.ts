@@ -333,6 +333,34 @@ describe('a message that arrives at the instant the timer ends', () => {
       ...outcomes['loses it']
     });
   });
+
+  // The take frees capacity in a full bounded queue, which resumes the
+  // blocked producer in the same step, and the producer ends the deadline.
+  it('with Effect.raceFirst and a hand-written Clock that a producer wakes when the take frees capacity, loses it', async () => {
+    const result = await run(({ started, wake }) =>
+      Effect.gen(function* () {
+        const messages = yield* Queue.bounded<string>(1);
+        const actor = yield* createEffectActor(raceFirst()).pipe(
+          Effect.provideService(Messages, messages)
+        );
+        yield* started(4_000);
+        Queue.offerUnsafe(messages, 'config changed');
+        yield* Effect.forkChild(
+          Queue.offer(messages, 'next').pipe(
+            Effect.andThen(Effect.sync(() => wake(4_000)))
+          ),
+          { startImmediately: true }
+        );
+        const { value, message } = yield* outcome(actor, messages);
+        return { value, message, rest: yield* Queue.takeAll(messages) };
+      })
+    );
+    expect(result).toEqual({
+      value: 'retryLater',
+      message: null,
+      rest: ['next']
+    });
+  });
 });
 
 // Ties on the real clock, with the offer armed before or after the task arms
@@ -366,8 +394,11 @@ it('keeps the message at ties with Effect.raceFirst on the real clock', async ()
       const actor = yield* createEffectActor(machine).pipe(
         Effect.provideService(Messages, messages)
       );
-      for (let i = 0; i < 100 && !deadlineArmed; i++) yield* Effect.yieldNow;
-      expect(deadlineArmed).toBe(true);
+      // An offer that fires first can end the race before the deadline starts.
+      if (!messageFirst) {
+        for (let i = 0; i < 100 && !deadlineArmed; i++) yield* Effect.yieldNow;
+        expect(deadlineArmed).toBe(true);
+      }
       yield* Effect.promise(() => early ?? offer());
       return yield* outcome(actor, messages);
     }).pipe(Effect.scoped, Effect.runPromise);
@@ -386,13 +417,15 @@ describe('the core deadline example under createEffectActor', () => {
     let waiter: ((value: string) => void) | undefined;
     const queue: MessageQueue = {
       take: (signal) =>
-        new Promise((resolvePromise, reject) => {
-          waiter = resolvePromise;
-          signal.addEventListener('abort', () => {
-            waiter = undefined;
-            reject(signal.reason);
-          });
-        })
+        signal.aborted
+          ? Promise.reject(signal.reason)
+          : new Promise((resolvePromise, reject) => {
+              waiter = resolvePromise;
+              signal.addEventListener('abort', () => {
+                waiter = undefined;
+                reject(signal.reason);
+              });
+            })
     };
     const offer = (value: string) =>
       waiter ? waiter(value) : items.push(value);
@@ -443,7 +476,7 @@ describe('the core deadline example under createEffectActor', () => {
     expect(items).toEqual(['config changed']);
   });
 
-  it('reports a message the take returned before the deadline, though the machine handles it after', async () => {
+  it('reports a message that the child sent while the root was still waiting', async () => {
     const { machine, offer } = createRetryActorLogic();
     const result = await run(() =>
       Effect.gen(function* () {
