@@ -260,9 +260,9 @@ Setting `timeout` without `onTimeout` throws when the machine is created in deve
 
 ## Racing an invocation against a timer
 
-When a timer's transition exits the invoking state before the child reports, the machine stops the child and the result never reaches `onDone`. An `after`, a state `timeout` and an invoke `timeout` each arrive as one event, and the child's completion is another. Stopping a child does not undo its work, such as taking an item from a queue or spending a one-time token. Nothing reports the loss as an error, and a queue that does not redeliver loses the item for good.
+When a timer's transition exits the invoking state before the child reports, the machine stops the child and the result never reaches `onDone`. An `after`, a state `timeout` and an invoke `timeout` each arrive as one event, and the child's completion is another. Stopping a child does not undo its work, such as taking an item from a queue. Nothing reports the loss as an error, and a queue that does not redeliver loses the item for good.
 
-An explicit `enq.stop` of the child, or stopping the parent, loses an unreported result the same way. A targetless `onDone` handles the completion and stays in the state, so a later `after` or state `timeout` can exit without losing the result. Handling the completion also cancels an invoke `timeout`.
+An explicit `enq.stop` of the child, or stopping the parent, also loses a result the child has not sent yet. A targetless `onDone` handles the completion and stays in the state, so a later `after` or state `timeout` can exit without losing the result. `onDone` also cancels an invoke `timeout`.
 
 ### When the loss happens
 
@@ -280,26 +280,26 @@ waiting: {
 }
 ```
 
-A turn here is one event-loop callback, such as a timer firing, plus the promise callbacks that run right after it. `createActor` with its built-in runtime and the default clock delivers a timer in the turn that fires it, and relays a child's completion in the turn that settles it. A child that finished before the timer fired wins. In that setup, a loss needs one of these cases:
+A turn here is one event-loop callback, such as a timer firing, plus the promise callbacks that run right after it. `createActor` is the [built-in runtime](durable-execution.md#driving-effects-yourself). With the default clock, it delivers a timer in the turn that fires it, and a child's completion in the turn in which its `run` promise settles. A child that finished before the timer fired wins. In that setup, a loss needs one of these cases:
 
-- A take that ignores `signal`, or rejects without withdrawing its request. The stopped child's request stays and consumes the next item. See [rule 1](#rules-for-the-child).
+- A take that breaks [rule 1](#rules-for-the-child). The stopped child's request stays and consumes the next item.
 - Asynchronous work after the take, such as saving the item before `run` returns.
 - A take that settles later. It removes the item in one turn and settles in a later one, such as a request to a queue server.
 - An exit in the same turn. The take settles in the turn that exits the state. That happens when another event exits it, an `exit` action of the state offers the item, or advancing a [simulated clock](testing.md#control-time) or synchronous fake timers fires the timer.
 
-The host runs the root actor and delivers its events. A host that queues events, such as `createEffectActor`, handles an event later than it was sent. A child can take an item in between, and its completion waits behind the timer.
+A host runs the root actor and delivers its events. One that queues events, such as `createEffectActor`, handles an event later than it was sent. A child can take an item in between, and its completion waits behind the timer.
 
 Pick the remedy:
 
-- `createActor` with the built-in runtime, the default clock, real timers and an in-memory queue. Follow the [rules for the child](#rules-for-the-child) and keep the machine timer.
+- The built-in runtime with the default clock, real timers and an in-memory queue, when nothing settles the take in the turn that exits the state. Follow the [rules for the child](#rules-for-the-child) and keep the machine timer.
 - A host that queues events. Follow the rules for the child, and use a [deadline inside the logic](#a-deadline-inside-the-logic) instead of a machine timer. If any other event can exit the state, [reserve, then commit](#reserve-then-commit).
 - A queue reached over a network, a take you cannot withdraw, or anything that can settle the take in the turn that exits the state. [Reserve, then commit](#reserve-then-commit).
 
-Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before you retry a lost result.
+Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before you retry work whose result was lost.
 
 ### Rules for the child
 
-Here `take` is your queue's consuming call and `run` is the function passed to `createAsyncLogic`, which receives an abort signal as `signal`. This child follows the rules:
+Here `take` is your queue's consuming call, and `run` receives an abort signal as `signal`. This child follows the rules:
 
 ```ts
 createAsyncLogic({
@@ -307,27 +307,27 @@ createAsyncLogic({
 });
 ```
 
-1. When `signal` aborts, `take` must withdraw its pending request synchronously, in the abort listener, so a later item cannot go to it.
+1. If `signal` has already aborted, `take` must reject without registering a request. If it aborts later, `take` must withdraw its pending request synchronously, in the abort listener.
 2. Once the take settles, `run` returns its value without awaiting anything else. Synchronous mapping is fine. To save the item, return it and save it in the next state.
 3. `take` must remove the item in the same turn that settles its promise. A take that settles later needs [reserve, then commit](#reserve-then-commit).
 
-If the timer wins, the machine stops the child, which aborts `signal`, and the item stays in the queue.
+If the timer's transition exits the state first, the machine stops the child, which aborts `signal`, and the item stays queued.
 
 The rules do not cover an exit in the same turn. With a simulated clock or synchronous fake timers, advance the clock after the turn that settles the take.
 
 ### A deadline inside the logic
 
-Use this on a host that queues events. On `createActor` it adds nothing beyond the rules.
+Use this on a host that queues events. On the built-in runtime the rules are enough.
 
-Async logic with a `timeout` aborts `signal` at the deadline, and only then errors with a `TimeoutError`. The child picks one outcome itself, an item or a `TimeoutError`, and no machine timer races its completion. The four cases under [when the loss happens](#when-the-loss-happens) still apply. For `createEffectLogic`, see [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide. The example below assumes an in-memory queue that follows rules 1 and 3:
+Async logic with a `timeout` aborts `signal` at the deadline, and only then errors with a `TimeoutError`. The child picks one outcome itself, and no machine timer races its completion. The four cases under [when the loss happens](#when-the-loss-happens) still apply. For `createEffectLogic`, see [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide. The example assumes an in-memory queue that follows rules 1 and 3:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
 ```ts
 import { createAsyncLogic, setup, TimeoutError } from 'xstate';
 
 /**
- * Your own queue. When its abort signal aborts, `take` must withdraw its
- * pending request synchronously, in the abort listener.
+ * Your own queue. `take` must reject at once if `signal` has already aborted,
+ * and withdraw its pending request in the abort listener if it aborts later.
  */
 export interface MessageQueue {
   take(signal: AbortSignal): Promise<string>;
@@ -371,7 +371,7 @@ On restore, an `after` timer keeps its [original deadline](persistence.md#preser
 
 ### Reserve, then commit
 
-When an item must survive any exit from the state, split the take into a reserve and a commit, with the work between them. Each runs in its own child. Until the commit, the queue holds the item and offers it again when the reservation expires. Most brokers offer this as a visibility timeout or an acknowledgement. This also covers a take that settles later and an exit in the same turn, so a plain `after` on the same state is safe:
+When an item must survive any exit from the state, split the take into a reserve and a commit, with the work between them. Each runs in its own child. Until the commit, the queue holds the item and offers it again when the reservation expires. Most brokers offer this as a visibility timeout or an acknowledgement. This also covers a take that settles later and an exit in the same turn, so a plain `after` is safe:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/reserve-then-commit.ts -->
 ```ts
@@ -437,7 +437,7 @@ export function createJobMachine(
 }
 ```
 
-A job can arrive twice. The work can finish and the commit fail, or the reservation can expire before the commit, and the broker offers the job again with a new receipt. A failed commit can also mean the broker recorded the commit and the reply was lost, so the error does not tell whether the job returns. Make the work idempotent by keying its writes on the job id, not on the receipt or the payload. A broker can start the reservation before the reply arrives, so reserve for longer than delivery, the work and the commit take together.
+A job can arrive twice. The work can finish and the commit fail, or the reservation can expire before the commit, and the broker offers the job again with a new receipt. A failed commit can also mean the broker recorded the commit and the reply was lost, so the error does not tell whether the job returns. Make the work idempotent by keying its writes on the job id, not on the receipt or the payload, and make those writes safe when two attempts overlap. The reservation can start before the reply arrives, so reserve for longer than delivery, the work and the commit take together.
 
 ## Referencing the child
 

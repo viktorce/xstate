@@ -1,8 +1,8 @@
 import { createAsyncLogic, setup, TimeoutError } from 'xstate';
 
 /**
- * Your own queue. When its abort signal aborts, `take` must withdraw its
- * pending request synchronously, in the abort listener.
+ * Your own queue. `take` must reject at once if `signal` has already aborted,
+ * and withdraw its pending request in the abort listener if it aborts later.
  */
 export interface MessageQueue {
   take(signal: AbortSignal): Promise<string>;

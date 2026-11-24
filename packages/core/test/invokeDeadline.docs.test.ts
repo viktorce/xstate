@@ -20,8 +20,14 @@ import {
   type MessageQueue
 } from './fixtures/invoke-deadline/take-or-deadline.ts';
 
-/** A queue whose pending take is withdrawn when its abort signal aborts. */
-function createMessageQueue(failure?: Error) {
+/**
+ * A queue that follows rule 1. With `settleAfter`, a take removes the offered
+ * item at once and settles that many milliseconds later.
+ */
+function createMessageQueue({
+  failure,
+  settleAfter
+}: { failure?: Error; settleAfter?: number } = {}) {
   const items: string[] = [];
   let waiters: Array<(value: string) => void> = [];
   const queue: MessageQueue & { offer(value: string): void } = {
@@ -32,9 +38,13 @@ function createMessageQueue(failure?: Error) {
     },
     take(signal) {
       if (failure) return Promise.reject(failure);
+      if (signal.aborted) return Promise.reject(signal.reason);
       if (items.length) return Promise.resolve(items.shift()!);
       return new Promise((resolvePromise, reject) => {
-        const waiter = (value: string) => resolvePromise(value);
+        const waiter = (value: string) =>
+          settleAfter === undefined
+            ? resolvePromise(value)
+            : setTimeout(() => resolvePromise(value), settleAfter);
         signal.addEventListener('abort', () => {
           waiters = waiters.filter((candidate) => candidate !== waiter);
           reject(signal.reason);
@@ -70,14 +80,13 @@ const createTimerMachine = (waiting: object) =>
 const takeOnly = (queue: MessageQueue) =>
   createAsyncLogic({ run: ({ signal }) => queue.take(signal) });
 
-// Passes `signal` to the take and returns `ms` after it settles. This is the
-// case the docs call asynchronous work after the take. To the machine, a take
-// that settles later looks the same.
-const takeThenWait = (ms: number) => (queue: MessageQueue) =>
+// Passes `signal` to the take and returns a second after it settles. This is
+// the case the docs call asynchronous work after the take.
+const takeThenWait = (queue: MessageQueue) =>
   createAsyncLogic({
     run: async ({ signal }) => {
       const value = await queue.take(signal);
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000));
       return value;
     }
   });
@@ -207,7 +216,7 @@ it.each(timerNames)(
 );
 
 it('reaches failed when take rejects with an error other than a timeout', async () => {
-  const { queue } = createMessageQueue(new Error('queue closed'));
+  const { queue } = createMessageQueue({ failure: new Error('queue closed') });
   const actor = createActor(createRetryMachine(queue)).start();
   await vi.advanceTimersByTimeAsync(0);
   expect(actor.getSnapshot().value).toBe('failed');
@@ -254,27 +263,48 @@ const takeWithoutWithdrawing = (queue: MessageQueue) =>
   });
 
 // An after timer fires at 4 seconds in each case.
-it.each<[string, (queue: MessageQueue) => AnyActorLogic, number]>([
+it.each<[string, (queue: MessageQueue) => AnyActorLogic, number, number?]>([
   [
     'a take that rejects without withdrawing its request, offered long after the timer',
     takeWithoutWithdrawing,
     10_000
   ],
-  ['work after the take, offered at 3.5 seconds', takeThenWait(1_000), 3_500],
+  ['work after the take, offered at 3.5 seconds', takeThenWait, 3_500],
   [
-    'a take that settles later, offered at 3.95 seconds',
-    takeThenWait(100),
-    3_950
+    'a take that settles 100 ms after it removes the message, offered at 3.95 seconds',
+    takeOnly,
+    3_950,
+    100
   ]
-])('loses the message to %s', async (_case, createChild, offerAt) => {
+])(
+  'loses the message to %s',
+  async (_case, createChild, offerAt, settleAfter) => {
+    const { queue, items } = createMessageQueue({ settleAfter });
+    const actor = createActor(
+      createTimerMachine(timers.after(createChild(queue)))
+    ).start();
+    await vi.advanceTimersByTimeAsync(offerAt);
+    queue.offer('config changed');
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect({ ...outcome(actor), items }).toEqual(lost);
+    actor.stop();
+  }
+);
+
+it('keeps the message when the take starts after the timer aborted signal', async () => {
   const { queue, items } = createMessageQueue();
+  const awaitSetupThenTake = createAsyncLogic({
+    run: async ({ signal }) => {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 5_000));
+      return queue.take(signal);
+    }
+  });
   const actor = createActor(
-    createTimerMachine(timers.after(createChild(queue)))
+    createTimerMachine(timers.after(awaitSetupThenTake))
   ).start();
-  await vi.advanceTimersByTimeAsync(offerAt);
+  await vi.advanceTimersByTimeAsync(6_000);
   queue.offer('config changed');
-  await vi.advanceTimersByTimeAsync(2_000);
-  expect({ ...outcome(actor), items }).toEqual(lost);
+  expect({ ...outcome(actor), items }).toEqual(kept);
   actor.stop();
 });
 
@@ -328,7 +358,8 @@ describe('an exit in the same turn', () => {
     async (_description, sameTurn, expected) => {
       const { queue, items } = createMessageQueue();
       const clock = new SimulatedClock();
-      const actor = createActor(createRetryMachine(queue), { clock }).start();
+      const machine = createTimerMachine(timers.after(takeOnly(queue)));
+      const actor = createActor(machine, { clock }).start();
       clock.increment(3_999);
       queue.offer('config changed');
       if (sameTurn) clock.increment(1);
@@ -380,13 +411,15 @@ describe('the documented reserve, then commit example', () => {
     };
     const jobs: JobQueue = {
       reserve: (signal) =>
-        new Promise((resolvePromise, reject) => {
-          waiter = (next) => resolvePromise(reserve(next));
-          signal.addEventListener('abort', () => {
-            waiter = undefined;
-            reject(signal.reason);
-          });
-        }),
+        signal.aborted
+          ? Promise.reject(signal.reason)
+          : new Promise((resolvePromise, reject) => {
+              waiter = (next) => resolvePromise(reserve(next));
+              signal.addEventListener('abort', () => {
+                waiter = undefined;
+                reject(signal.reason);
+              });
+            }),
       commit: async (receipt) => {
         if (fail === 'commit') throw new Error('broker unavailable');
         if (!expiries.has(receipt)) throw new Error('reservation expired');
