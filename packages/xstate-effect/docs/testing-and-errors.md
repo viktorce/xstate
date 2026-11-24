@@ -17,6 +17,8 @@ This helper does not await invoked tasks, background actions, child replies such
 
 Existing `@xstate/test` SUT sessions accept async sends. Set their `send` function to an adapter that runs `sendAndAwait` and resolves to void, and `read` to the actor's snapshot projection. The package test suite exercises this through the real `testPaths` API.
 
+XState's [path generation](../../../docs/model-based-testing.md) works on the machine itself. Execute generated paths against an actor from `createEffectActor`, or use `testPaths()` from `@xstate/test`.
+
 ## TestClock
 
 A release approval expires after 30 seconds. `TestClock` drives the same `after` transition without waiting for real time:
@@ -54,12 +56,169 @@ export const result = await Effect.runPromise(
 console.log(result); // 'expired', with no 30-second wait
 ```
 
+This test advances the clock with no wait. Its timer belongs to the initial state, so the actor starts it during startup. When a later state starts the timer, [wait for that state first](#wait-for-the-timer-to-start-before-advancing-the-clock).
+
 - Timers use Effect's `Clock`, including delayed sends.
 - `waitFor` and `join` fail if the actor stops before reaching the expected result.
 - Add `waitFor`'s `{ timeout }` to bound a wait. With `TestClock`, advance the clock to trigger that timeout too.
 - Use `inspect` for execution traces and `deadLetters` for delivery failures.
+- The examples and rules in this section use `TestClock.layer()` with Effect's default scheduler.
 
-XState's [path generation](../../../docs/model-based-testing.md) works on the machine itself. Execute generated paths against an actor from `createEffectActor`, or use `testPaths()` from `@xstate/test`.
+### Wait for the timer to start before advancing the clock
+
+`TestClock.adjust` fires the timers that come due during the advance. It can return before an actor enters the state that starts an `after` timer. That timer then counts from the new time, and that call to `adjust` does not fire it. A `waitFor` for the timer's transition hangs until the test runner stops the test. A `{ timeout }` on that `waitFor` does not help, because the timeout runs on the test clock too. An assertion that nothing happened can also pass for the wrong reason, because the timer has not started.
+
+Wait for the state that starts the timer, then advance the clock:
+
+<!-- example from examples/effect-workflows/src/clock-after-invoke.ts -->
+
+```ts
+import { Effect } from 'effect';
+import { TestClock } from 'effect/testing';
+import {
+  createEffectActor,
+  createEffectLogic,
+  setupEffect,
+  waitFor
+} from '@xstate/effect';
+
+let attempts = 0;
+const connect = createEffectLogic(
+  Effect.gen(function* () {
+    // The yield stands in for real I/O. It is why the test below must wait
+    // for `backoff` before it advances the clock.
+    yield* Effect.yieldNow;
+    attempts++;
+    if (attempts < 2) {
+      return yield* Effect.fail(new Error('Connection refused'));
+    }
+    return 'connected';
+  })
+);
+
+const connectionMachine = setupEffect({ actors: { connect } }).createMachine({
+  initial: 'idle',
+  states: {
+    idle: { on: { CONNECT: { target: 'connecting' } } },
+    connecting: {
+      invoke: {
+        src: 'connect',
+        onDone: { target: 'connected' },
+        onError: { target: 'backoff' }
+      }
+    },
+    backoff: { after: { 3000: { target: 'connecting' } } },
+    connected: {}
+  }
+});
+
+const test = Effect.gen(function* () {
+  const actor = yield* createEffectActor(connectionMachine);
+  actor.send({ type: 'CONNECT' });
+  // Wait for the first failure to start the backoff timer. Without this wait
+  // the clock moves first and the last `waitFor` never returns.
+  yield* waitFor(actor, (s) => s.matches('backoff'));
+  yield* TestClock.adjust('3 seconds');
+  const snapshot = yield* waitFor(actor, (s) => s.matches('connected'));
+  return snapshot.value;
+});
+
+export const result = await Effect.runPromise(
+  test.pipe(Effect.scoped, Effect.provide(TestClock.layer()))
+);
+console.log(result); // 'connected', after one 3-second backoff
+```
+
+The clock can move first in cases like these:
+
+- The actor reaches the timer's state through invoked work or a background action that yields, awaits a Promise or does I/O. Any of these can let the clock advance before the actor starts the timer. If that work sleeps on the test clock, [wait for its sleep to start and advance the clock for it](#wait-for-a-sleep-to-start-before-advancing-the-clock) first.
+- A long run of queued events or a slow step comes before the event that starts the timer. The actor loop yields under continuous traffic, as the [actors guide](actors.md) describes, and it decides when to yield partly by elapsed real time. A test that sends several events and advances the clock with no wait can pass locally and fail on a slower CI machine.
+
+Details for applying the wait:
+
+- `sendAndAwait` is enough when the event you send enters the timer's state. It does not wait for an invoked actor's `onDone` or `onError`, so use `waitFor` when one of those transitions enters the timer's state.
+- When an invoked actor runs between two timers, advance the clock for the first timer, wait for the state that starts the second, then advance for the second. One `adjust` across both can finish before the second timer starts. If the invoked Effect sleeps on the test clock, [wait for its sleep to start and advance for it](#wait-for-a-sleep-to-start-before-advancing-the-clock) before that wait.
+- A delayed `raise` or `sendTo` starts its timer when its action runs, and the actor can stay in the same state. When an event the test sends runs the action, acknowledge that event with `sendAndAwait`, then advance the clock. When a later transition runs it, such as an invoke's `onDone`, wait for a state or context change that the transition makes.
+- `waitFor` succeeds at once when the actor already matches, so it cannot see the actor leave a state and come back. When an event takes the actor out of the state you wait for and a later transition brings it back, acknowledge the event with `sendAndAwait` first, then wait for the state. When the event re-enters the state in the same step, as a transition with `reenter: true` does to reset its timer, you do not need `waitFor` after `sendAndAwait`.
+
+### Wait for a sleep to start before advancing the clock
+
+Invoked Effects and background actions can sleep on the test clock themselves. An advance that runs before such a sleep starts does not count toward it. The sleep still needs its full duration, and a `waitFor` on the state after the work hangs. Wait for each sleep to start, then advance the clock for it.
+
+- A sleep that comes before any yield or I/O starts in the step that starts the work. Wait for the state that invokes the Effect or runs the action. When the event you send starts the work without a state change, as a restart of an invoke with `reenter: true` does, acknowledge that event with `sendAndAwait`.
+- A sleep that follows a yield or I/O has no actor state to mark its start, so the test needs a signal from inside the work. Create an unbounded `Queue` in the test, offer to it just before each sleep and take from it before each advance.
+
+This test makes the offer from its implementation of a service that the Effect calls right before it sleeps:
+
+<!-- example from examples/effect-workflows/src/clock-sleep-signal.ts -->
+
+```ts
+import { Context, Effect, Queue } from 'effect';
+import { TestClock } from 'effect/testing';
+import {
+  createEffectActor,
+  createEffectLogic,
+  setupEffect,
+  waitFor
+} from '@xstate/effect';
+
+class Rollout extends Context.Service<
+  Rollout,
+  { readonly status: Effect.Effect<'ready' | 'not ready'> }
+>()('@app/Rollout') {}
+
+const poll = createEffectLogic(
+  Effect.gen(function* () {
+    const rollout = yield* Rollout;
+    while ((yield* rollout.status) === 'not ready') {
+      yield* Effect.sleep('5 seconds');
+    }
+    return 'ready';
+  })
+);
+
+const rolloutMachine = setupEffect({ actors: { poll } }).createMachine({
+  initial: 'idle',
+  states: {
+    idle: { on: { DEPLOY: { target: 'polling' } } },
+    polling: { invoke: { src: 'poll', onDone: { target: 'live' } } },
+    live: { type: 'final' }
+  }
+});
+
+const test = Effect.gen(function* () {
+  const sleeping = yield* Queue.unbounded<void>();
+  let calls = 0;
+  const status = Effect.gen(function* () {
+    // The host timer stands in for real I/O.
+    yield* Effect.promise(
+      () => new Promise((resolve) => setTimeout(resolve, 5))
+    );
+    if (++calls === 3) return 'ready' as const;
+    // The offer marks the moment before the poll sleeps.
+    yield* Queue.offer(sleeping, undefined);
+    return 'not ready' as const;
+  });
+  const actor = yield* createEffectActor(rolloutMachine).pipe(
+    Effect.provideService(Rollout, { status })
+  );
+  actor.send({ type: 'DEPLOY' });
+  // Without this take the clock moves first and `waitFor` never returns.
+  yield* Queue.take(sleeping);
+  yield* TestClock.adjust('5 seconds');
+  yield* Queue.take(sleeping);
+  yield* TestClock.adjust('5 seconds');
+  const snapshot = yield* waitFor(actor, (s) => s.matches('live'));
+  return snapshot.value;
+});
+
+export const result = await Effect.runPromise(
+  test.pipe(Effect.scoped, Effect.provide(TestClock.layer()))
+);
+console.log(result); // 'live', after two 5-second sleeps
+```
+
+When the work calls no service before it sleeps, make the offer from a replacement Effect or action that you give `createEffectActor` through `machine.provide({ actors })` or `machine.provide({ actions })`.
 
 ## Retry a task
 

@@ -57,6 +57,8 @@ describe('runnable examples', () => {
   const cases = [
     ['approval', 'https://example.com/v1.2.0'],
     ['clock', 'expired'],
+    ['clock-after-invoke', 'connected'],
+    ['clock-sleep-signal', 'live'],
     ['persistence', 'done'],
     ['boundaries', 5],
     ['failure-cause', 'NOT_FOUND'],

@@ -6,6 +6,7 @@ import {
   Effect,
   Exit,
   Fiber,
+  Queue,
   Scope,
   Stream
 } from 'effect';
@@ -29,8 +30,10 @@ import {
   createEffectLogic,
   createEffectEventStreamLogic,
   createEffectStreamLogic,
+  sendAndAwait,
   setupEffect,
   join,
+  waitFor,
   withActorScope
 } from './index.ts';
 
@@ -659,6 +662,326 @@ describe('@xstate/effect runtime', () => {
         })
       ).pipe(Effect.provide(TestClock.layer()))
     );
+  });
+
+  // These tests pin the waits that docs/testing-and-errors.md describes under
+  // "Wait for the timer to start before advancing the clock" and "Wait for a
+  // sleep to start before advancing the clock". Change the guide when one of
+  // them changes.
+  describe('TestClock waits from the testing guide', () => {
+    it.each([
+      ['yields to the scheduler', Effect.as(Effect.yieldNow, 'ok')],
+      [
+        'awaits a host timer',
+        Effect.promise(
+          () => new Promise<string>((resolve) => setTimeout(resolve, 0, 'ok'))
+        )
+      ]
+    ])(
+      'fires a timer at its deadline after an invoked Effect that %s',
+      async (_, work) => {
+        const machine = setupEffect({
+          actors: { connect: createEffectLogic(work) }
+        }).createMachine({
+          initial: 'idle',
+          states: {
+            idle: { on: { CONNECT: { target: 'connecting' } } },
+            connecting: {
+              invoke: { src: 'connect', onDone: { target: 'backoff' } }
+            },
+            backoff: { after: { 3000: { target: 'retrying' } } },
+            retrying: {}
+          }
+        });
+
+        await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const actor = yield* createEffectActor(machine);
+              actor.send({ type: 'CONNECT' });
+
+              // TestClock.adjust does not wait for the actor to reach the
+              // timer's state.
+              yield* waitFor(actor, (state) => state.matches('backoff'));
+              yield* TestClock.adjust('2999 millis');
+              expect(actor.getSnapshot().value).toBe('backoff');
+
+              // A timer started late would not be due yet.
+              yield* TestClock.adjust('1 millis');
+              yield* waitFor(actor, (state) => state.matches('retrying'));
+            })
+          ).pipe(Effect.provide(TestClock.layer()))
+        );
+      }
+    );
+
+    it('fires the second of two timers at its deadline around a yielding invoke', async () => {
+      const machine = setupEffect({
+        actors: {
+          work: createEffectLogic(
+            Effect.gen(function* () {
+              for (let turn = 0; turn < 5; turn++) {
+                yield* Effect.yieldNow;
+              }
+              return 'ok';
+            })
+          )
+        }
+      }).createMachine({
+        initial: 'first',
+        states: {
+          first: { after: { 1000: { target: 'working' } } },
+          working: { invoke: { src: 'work', onDone: { target: 'second' } } },
+          second: { after: { 1000: { target: 'done' } } },
+          done: {}
+        }
+      });
+
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const actor = yield* createEffectActor(machine);
+
+            yield* TestClock.adjust('1 second');
+            yield* waitFor(actor, (state) => state.matches('second'));
+            yield* TestClock.adjust('999 millis');
+            expect(actor.getSnapshot().value).toBe('second');
+
+            yield* TestClock.adjust('1 millis');
+            yield* waitFor(actor, (state) => state.matches('done'));
+          })
+        ).pipe(Effect.provide(TestClock.layer()))
+      );
+    });
+
+    // More events than `MAX_STEPS_PER_SLICE` in createEffectActor.ts, so the
+    // loop yields before it reaches the event that follows them.
+    const moreThanOneSlice = 600;
+
+    it('fires a timer at its deadline after queued events and an invoke that sleeps', async () => {
+      const machine = setupEffect({
+        actors: {
+          connect: createEffectLogic(
+            Effect.gen(function* () {
+              yield* Effect.sleep('1 second');
+              // The work after the sleep is why `backoff` needs its own wait.
+              yield* Effect.promise(() => Promise.resolve());
+              for (let turn = 0; turn < 5; turn++) {
+                yield* Effect.yieldNow;
+              }
+              return 'ok';
+            })
+          )
+        }
+      }).createMachine({
+        initial: 'idle',
+        states: {
+          idle: {
+            on: { PING: {}, CONNECT: { target: 'connecting' } }
+          },
+          connecting: {
+            invoke: { src: 'connect', onDone: { target: 'backoff' } }
+          },
+          backoff: { after: { 3000: { target: 'retrying' } } },
+          retrying: {}
+        }
+      });
+
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const actor = yield* createEffectActor(machine);
+            // With this many events queued, an `adjust` with no wait runs
+            // before the actor reaches `connecting`.
+            for (let ping = 0; ping < moreThanOneSlice; ping++) {
+              actor.send({ type: 'PING' });
+            }
+            actor.send({ type: 'CONNECT' });
+
+            // The invoked Effect sleeps at once, so the state that invokes it
+            // marks the start of the sleep.
+            yield* waitFor(actor, (state) => state.matches('connecting'));
+            yield* TestClock.adjust('1 second');
+            yield* waitFor(actor, (state) => state.matches('backoff'));
+            yield* TestClock.adjust('2999 millis');
+            expect(actor.getSnapshot().value).toBe('backoff');
+
+            yield* TestClock.adjust('1 millis');
+            yield* waitFor(actor, (state) => state.matches('retrying'));
+          })
+        ).pipe(Effect.provide(TestClock.layer()))
+      );
+    });
+
+    it('advances a sleep inside an invoked Effect after a Queue signal', async () => {
+      const connect = (beforeSleep: Effect.Effect<unknown>) =>
+        createEffectLogic(
+          Effect.gen(function* () {
+            for (let turn = 0; turn < 5; turn++) {
+              yield* Effect.yieldNow;
+            }
+            yield* beforeSleep;
+            yield* Effect.sleep('1 second');
+            return 'ok';
+          })
+        );
+      const machine = setupEffect({
+        actors: { connect: connect(Effect.void) }
+      }).createMachine({
+        initial: 'idle',
+        states: {
+          idle: { on: { CONNECT: { target: 'connecting' } } },
+          connecting: {
+            invoke: { src: 'connect', onDone: { target: 'connected' } }
+          },
+          connected: {}
+        }
+      });
+
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const sleeping = yield* Queue.unbounded<void>();
+            const actor = yield* createEffectActor(
+              machine.provide({
+                actors: { connect: connect(Queue.offer(sleeping, undefined)) }
+              })
+            );
+            actor.send({ type: 'CONNECT' });
+
+            // The invoked Effect yields before it reaches its sleep, so
+            // `connecting` does not mark the start of the sleep.
+            yield* Queue.take(sleeping);
+            yield* TestClock.adjust('999 millis');
+            expect(actor.getSnapshot().value).toBe('connecting');
+
+            yield* TestClock.adjust('1 millis');
+            yield* waitFor(actor, (state) => state.matches('connected'));
+          })
+        ).pipe(Effect.provide(TestClock.layer()))
+      );
+    });
+
+    it('fires a re-entered timer at the new deadline after sendAndAwait', async () => {
+      const machine = setupEffect({
+        actors: {
+          connect: createEffectLogic(
+            Effect.gen(function* () {
+              for (let turn = 0; turn < 5; turn++) {
+                yield* Effect.yieldNow;
+              }
+              return 'ok';
+            })
+          )
+        }
+      }).createMachine({
+        initial: 'backoff',
+        states: {
+          backoff: {
+            after: { 3000: { target: 'retrying' } },
+            on: { RESTART: { target: 'connecting' } }
+          },
+          connecting: {
+            invoke: { src: 'connect', onDone: { target: 'backoff' } }
+          },
+          retrying: {}
+        }
+      });
+
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const actor = yield* createEffectActor(machine);
+            yield* TestClock.adjust('1 second');
+
+            // Without the receipt, waitFor would match the first backoff.
+            yield* sendAndAwait(actor, { type: 'RESTART' });
+            yield* waitFor(actor, (state) => state.matches('backoff'));
+            yield* TestClock.adjust('2999 millis');
+            expect(actor.getSnapshot().value).toBe('backoff');
+
+            yield* TestClock.adjust('1 millis');
+            yield* waitFor(actor, (state) => state.matches('retrying'));
+          })
+        ).pipe(Effect.provide(TestClock.layer()))
+      );
+    });
+
+    it('wakes a sleep in a restarted invoke at the new deadline after sendAndAwait', async () => {
+      const machine = setupEffect({
+        actors: {
+          connect: createEffectLogic(Effect.as(Effect.sleep('1 second'), 'ok'))
+        }
+      }).createMachine({
+        initial: 'connecting',
+        states: {
+          connecting: {
+            invoke: { src: 'connect', onDone: { target: 'connected' } },
+            on: { PING: {}, RETRY: { target: 'connecting', reenter: true } }
+          },
+          connected: {}
+        }
+      });
+
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const actor = yield* createEffectActor(machine);
+            yield* TestClock.adjust('500 millis');
+            for (let ping = 0; ping < moreThanOneSlice; ping++) {
+              actor.send({ type: 'PING' });
+            }
+
+            // The actor stays in `connecting`, so only the receipt marks the
+            // restart.
+            yield* sendAndAwait(actor, { type: 'RETRY' });
+            yield* TestClock.adjust('999 millis');
+            expect(actor.getSnapshot().value).toBe('connecting');
+
+            yield* TestClock.adjust('1 millis');
+            yield* waitFor(actor, (state) => state.matches('connected'));
+          })
+        ).pipe(Effect.provide(TestClock.layer()))
+      );
+    });
+
+    it('fires a delayed raise at its deadline after sendAndAwait', async () => {
+      const machine = createMachine({
+        initial: 'idle',
+        states: {
+          idle: {
+            on: {
+              PING: {},
+              ARM: (_, enq) => {
+                enq.raise({ type: 'FIRE' }, { delay: 1000 });
+              },
+              FIRE: { target: 'fired' }
+            }
+          },
+          fired: {}
+        }
+      });
+
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const actor = yield* createEffectActor(machine);
+            for (let ping = 0; ping < moreThanOneSlice; ping++) {
+              actor.send({ type: 'PING' });
+            }
+
+            // The actor stays in `idle`, so only the receipt marks the start of
+            // the timer.
+            yield* sendAndAwait(actor, { type: 'ARM' });
+            yield* TestClock.adjust('999 millis');
+            expect(actor.getSnapshot().value).toBe('idle');
+
+            yield* TestClock.adjust('1 millis');
+            yield* waitFor(actor, (state) => state.matches('fired'));
+          })
+        ).pipe(Effect.provide(TestClock.layer()))
+      );
+    });
   });
 
   it('interrupts a pending after timer when the enclosing scope closes', async () => {

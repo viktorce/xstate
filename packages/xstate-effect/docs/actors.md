@@ -153,7 +153,7 @@ If the machine requires services, provide their Layers to the actor Layer with `
 
 ## Clock
 
-`after` transitions and delayed sends use Effect's `Clock`. In tests, `TestClock` advances those timers without waiting for real time. See the [complete deadline example](testing-and-errors.md#testclock).
+`after` transitions and delayed sends use Effect's `Clock`. In tests, `TestClock` advances those timers without waiting for real time. Before advancing the clock, [wait for the timer to start](testing-and-errors.md#wait-for-the-timer-to-start-before-advancing-the-clock). See the [complete deadline example](testing-and-errors.md#testclock).
 
 Timers are interrupted when the actor stops.
 
