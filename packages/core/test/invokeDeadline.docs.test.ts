@@ -191,11 +191,11 @@ describe.each([
 });
 
 it.each(timerNames)(
-  'keeps the message at ties with %s and real timers',
+  'keeps the message with %s and equal delays on real timers',
   async (timer) => {
     vi.useRealTimers();
-    // Five rounds of ties in both arming orders. Real timers do not promise
-    // an order, so either winner is valid.
+    // Five rounds at equal delays in both arming orders. Real timers do not
+    // promise an order, so either winner is valid.
     for (let round = 0; round < 5; round++) {
       const runs = [true, false].map(async (messageFirst) => {
         const { queue, items } = createMessageQueue();

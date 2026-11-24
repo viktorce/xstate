@@ -260,8 +260,6 @@ const outcomes = {
   'loses it': { value: 'retryLater', message: null, size: 0 }
 };
 
-// The 3,000 Effect.map row covers the operation budget. Its threshold is an
-// Effect internal, and 3,000 is far past it.
 // A row that expects a loss is a deliberate alarm. The `after` rows depend on
 // the root mailbox in createEffectActor.ts, and the others on Effect.
 describe('a message that arrives at the instant the timer ends', () => {
@@ -282,6 +280,8 @@ describe('a message that arrives at the instant the timer ends', () => {
       'offered to the waiting take before the timer ends',
       'loses it'
     ],
+    // Pins Effect's operation budget, after which a fiber yields. An Effect
+    // upgrade may change it without anything being wrong in this package.
     [
       'Effect.raceFirst and 3,000 Effect.map calls after the take',
       'offered to the waiting take before the timer ends',
@@ -304,6 +304,11 @@ describe('a message that arrives at the instant the timer ends', () => {
     ],
     ['an `after` timer', 'offered before the timer ends', 'loses it'],
     ['an `after` timer', 'offered after the timer ends', 'loses it'],
+    [
+      'an `after` timer in a nested machine',
+      'offered to the waiting take before the timer ends',
+      'reports it'
+    ],
     [
       'an `after` timer in a nested machine',
       'offered before the timer ends',
@@ -356,8 +361,9 @@ describe('a message that arrives at the instant the timer ends', () => {
     });
   });
 
-  // The take frees capacity in a full bounded queue, which resumes the
-  // blocked producer in the same step, and the producer ends the deadline.
+  // Pins that Effect resumes a producer blocked on a full queue in the step
+  // whose take frees capacity, and that producer ends the deadline. An Effect
+  // upgrade may change it without anything being wrong in this package.
   it('with Effect.raceFirst and a hand-written Clock that a producer wakes when the take frees capacity, loses it', async () => {
     const result = await run(({ started, wake }) =>
       Effect.gen(function* () {
@@ -385,9 +391,9 @@ describe('a message that arrives at the instant the timer ends', () => {
   });
 });
 
-// Ties on the real clock, with the offer armed before or after the task arms
-// its deadline. Real timers do not promise an order, so either winner is valid.
-it('keeps the message at ties with Effect.raceFirst on the real clock', async () => {
+// Equal delays on the real clock, offered before or after the task arms its
+// deadline. Real timers do not promise an order, so either winner is valid.
+it('keeps the message with Effect.raceFirst and equal delays on the real clock', async () => {
   let deadlineArmed = false;
   const machine = createRetryMachine(
     Messages.use((messages) =>
@@ -512,7 +518,6 @@ describe('the core deadline example under createEffectActor', () => {
           for (let i = 0; i < 100 && child.getSnapshot().status !== 'done'; i++)
             await Promise.resolve();
           expect(child.getSnapshot().status).toBe('done');
-          vi.advanceTimersByTime(1);
           return actor.getSnapshot().value;
         });
         const { value, context } = yield* settled(actor);
@@ -526,6 +531,8 @@ describe('the core deadline example under createEffectActor', () => {
     });
   });
 
+  // Pins that TestClock moves only Effect's Clock, not the global timers. An
+  // Effect upgrade may change it without anything being wrong in this package.
   // Delete this test and the guide sentence about TestClock when this timeout
   // moves to the Effect clock.
   it('runs an async logic timeout on the global timers, not on TestClock', async () => {
