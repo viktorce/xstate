@@ -36,6 +36,7 @@ it('reaches retryLater with no message when none arrives before the deadline', a
 // synchronous step. A Clock whose sleep ends only when the test calls
 // `wakeDeadline` decides that step, and `Queue.flushUnsafe` hands the message
 // to the take at once. The first of the two wins, and the loser keeps nothing.
+// The third tie schedule is in packages/xstate-effect/src/deadlineRace.test.ts.
 const reported = { value: 'retryNow', message: 'config changed', size: 0 };
 const kept = { value: 'retryLater', message: null, size: 1 };
 it.each([

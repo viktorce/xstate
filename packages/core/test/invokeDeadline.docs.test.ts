@@ -293,6 +293,12 @@ it.each<[string, (queue: MessageQueue) => AnyActorLogic, number, number?]>([
 
 it('keeps the message when the take starts after the timer aborted signal', async () => {
   const { queue, items } = createMessageQueue();
+  const abortedAtTake: boolean[] = [];
+  const take = queue.take;
+  vi.spyOn(queue, 'take').mockImplementation((signal) => {
+    abortedAtTake.push(signal.aborted);
+    return take(signal);
+  });
   const awaitSetupThenTake = createAsyncLogic({
     run: async ({ signal }) => {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 5_000));
@@ -304,6 +310,7 @@ it('keeps the message when the take starts after the timer aborted signal', asyn
   ).start();
   await vi.advanceTimersByTimeAsync(6_000);
   queue.offer('config changed');
+  expect(abortedAtTake).toEqual([true]);
   expect({ ...outcome(actor), items }).toEqual(kept);
   actor.stop();
 });
@@ -374,10 +381,12 @@ describe('an exit in the same turn', () => {
     // The offer is armed first, so it fires first, but the take has not
     // reported when the deadline fires in the same turn.
     const { queue, items } = createMessageQueue();
-    setTimeout(() => queue.offer('config changed'), 4_000);
+    const offer = vi.fn(() => queue.offer('config changed'));
+    setTimeout(offer, 4_000);
     const actor = createActor(createRetryMachine(queue)).start();
     vi.advanceTimersByTime(4_000);
     await vi.advanceTimersByTimeAsync(0);
+    expect(offer).toHaveBeenCalledOnce();
     expect({ ...outcome(actor), items }).toEqual(lost);
     actor.stop();
   });

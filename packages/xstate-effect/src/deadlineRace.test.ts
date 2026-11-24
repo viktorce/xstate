@@ -137,6 +137,15 @@ const machines = {
         { startImmediately: true }
       ).pipe(Effect.andThen(takeMessage(messages)))
   ),
+  'Effect.raceFirst and 3,000 Effect.map calls after the take': raceFirst(
+    (messages) =>
+      Array.from({ length: 3_000 })
+        .reduce(
+          (take: Effect.Effect<string>) => take.pipe(Effect.map((m) => m)),
+          Queue.take(messages)
+        )
+        .pipe(Effect.map(toMessage))
+  ),
   'Effect.timeoutOption': timeoutOption,
   'an `after` timer': afterTimer,
   'an `after` timer in a nested machine': createParentMachine(afterTimer)
@@ -251,7 +260,8 @@ const outcomes = {
   'loses it': { value: 'retryLater', message: null, size: 0 }
 };
 
-// No row covers the operation budget, whose threshold is an Effect internal.
+// The 3,000 Effect.map row covers the operation budget. Its threshold is an
+// Effect internal, and 3,000 is far past it.
 // A row that expects a loss is a deliberate alarm. The `after` rows depend on
 // the root mailbox in createEffectActor.ts, and the others on Effect.
 describe('a message that arrives at the instant the timer ends', () => {
@@ -269,6 +279,11 @@ describe('a message that arrives at the instant the timer ends', () => {
     ],
     [
       'Effect.raceFirst and a forked child with slow cleanup',
+      'offered to the waiting take before the timer ends',
+      'loses it'
+    ],
+    [
+      'Effect.raceFirst and 3,000 Effect.map calls after the take',
       'offered to the waiting take before the timer ends',
       'loses it'
     ],
@@ -293,6 +308,11 @@ describe('a message that arrives at the instant the timer ends', () => {
       'an `after` timer in a nested machine',
       'offered before the timer ends',
       'keeps it queued'
+    ],
+    [
+      'an `after` timer in a nested machine',
+      'offered after the timer ends',
+      'keeps it queued'
     ]
   ] as const)(
     'with %s, when the message is %s, %s',
@@ -302,6 +322,8 @@ describe('a message that arrives at the instant the timer ends', () => {
           const messages = yield* Messages;
           const actor = yield* createEffectActor(machines[timer]);
           yield* started(4_000);
+          // The 3,000 Effect.map branch yields once before its take waits.
+          for (let i = 0; i < 3; i++) yield* Effect.yieldNow;
           yield* Effect.sync(() =>
             schedules[schedule](messages, () => wake(4_000))
           );
@@ -482,7 +504,7 @@ describe('the core deadline example under createEffectActor', () => {
       Effect.gen(function* () {
         const actor = yield* createEffectActor(machine);
         yield* armed;
-        const valueAtDeadline = yield* Effect.promise(async () => {
+        const valueAfterChildFinished = yield* Effect.promise(async () => {
           vi.advanceTimersByTime(3_999);
           offer('config changed');
           // The child finishes in microtasks, before Effect's next step.
@@ -494,11 +516,11 @@ describe('the core deadline example under createEffectActor', () => {
           return actor.getSnapshot().value;
         });
         const { value, context } = yield* settled(actor);
-        return { valueAtDeadline, value, message: context.message };
+        return { valueAfterChildFinished, value, message: context.message };
       })
     );
     expect(result).toEqual({
-      valueAtDeadline: 'waiting',
+      valueAfterChildFinished: 'waiting',
       value: 'retryNow',
       message: 'config changed'
     });
