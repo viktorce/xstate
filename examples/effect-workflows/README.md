@@ -46,7 +46,7 @@ INSPECT=1 pnpm --filter @xstate/example-effect-workflows exec tsx src/custom-act
 - `actions.ts`, `custom-actions.ts` and `provided-actions.ts`: runtime schema validation, typed action arguments, background audits and service requirements after overrides.
 - `resources.ts`: invocation cleanup and resources retained with `withActorScope`.
 - `atoms.ts`, `input-atoms.ts`, `react.tsx` and `selector.tsx`: atom ownership, required input and React consumers.
-- `clock.ts`, `retry.ts`, `supervision.ts`, `errors.ts` and `failure-cause.ts`: deadlines, retries, typed failures and Cause inspection.
+- `clock.ts`, `clock-after-invoke.ts`, `clock-sleep-signal.ts`, `retry.ts`, `supervision.ts`, `errors.ts` and `failure-cause.ts`: deadlines, a timer that starts after invoked work, a test signal for sleeps inside invoked work, retries, typed failures and Cause inspection.
 - `boundaries.ts`: decode external input and events before synchronous validation.
 - `persistence.ts` and `persistence-codec.ts`: causal event receipts and schema-backed snapshots with rich values.
 
