@@ -21,7 +21,7 @@ The timer starts when the state is entered and is canceled when the state is exi
 
 `onTimeout` is required whenever a state declares a `timeout`. In development builds, a machine declaring `timeout` without `onTimeout` throws when it is created. An `onTimeout` without a `timeout` does not schedule a timer.
 
-If `onTimeout` exits the state while an invoked child is still working, the machine stops the child and drops a result it has not reported. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
+If `onTimeout` exits the state while an invoked child is still working, the machine stops the child and loses a result it has not reported. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
 
 `timeout` and [`after`](delays.md) are independent timers and can be used on the same state. `after` schedules a transition at a point in time; `timeout` expresses a deadline for the work the state represents.
 
@@ -71,7 +71,7 @@ uploading: {
 
 `onTimeout` is required when an invocation has a `timeout`; omitting it throws at machine creation in development builds. The timer is canceled when the invoked actor completes, even if the state stays active. Unlike state timeouts, invocation timeouts are not resolved against named delays.
 
-The timeout and the child's completion are separate events. If `onTimeout` exits the state before the child reports, the machine stops the child and drops its result. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
+If `onTimeout` exits the state before the child reports, the machine loses the result, as [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer) explains.
 
 ## Async logic timeouts
 

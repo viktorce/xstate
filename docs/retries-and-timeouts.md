@@ -35,7 +35,7 @@ const requestMachine = createMachine({
 
 `timeout` limits the invocation. `onTimeout` is required when an invocation has a timeout. The delayed transition makes the pause between attempts visible: `waitingToRetry` is a state you can show a spinner for, assert in a test and see in a visualization.
 
-The invocation `timeout` and the child's completion are separate events, so a child that took a queue item but had not reported it can lose it to the timer. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
+The invocation `timeout` and the child's completion are separate events, so if the timer wins, the machine loses a result the child had not reported. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
 
 ## Failure and deadline are different outcomes
 
