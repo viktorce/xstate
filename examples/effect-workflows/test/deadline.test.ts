@@ -62,8 +62,8 @@ it.each([
       if (takeFirst) deliver();
       wakeDeadline!();
       if (!takeFirst) deliver();
-      const reported = yield* finish(actor);
-      return { ...reported, size: yield* Queue.size(messages) };
+      const finished = yield* finish(actor);
+      return { ...finished, size: yield* Queue.size(messages) };
     })
   );
   expect(result).toEqual(takeFirst ? reported : kept);

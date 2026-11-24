@@ -94,7 +94,7 @@ A state timer can make the machine lose an item that an invoked task already too
 
 The root machine under `createEffectActor` receives events through one mailbox and handles them in the order they arrive. The timer's event can already be in the mailbox when the task takes an item from a `Queue`. That can happen even if the item was offered before the timer fired, because Effect can resume a waiting `Queue.take` on a later step. A step here is one run of a fiber, from when it resumes until it waits, yields or ends, together with the fibers it resumes synchronously, such as a race waiting for it. A nested machine receives its events directly and handles the timer when it fires, so this case does not apply to it.
 
-When the result must not be lost to a timer, race the deadline inside the task, as the example below does. This needs Effect 4.0.2 or later. On 4.0.0 and 4.0.1, a waiting take under `Effect.timeoutOption` can return `Option.none()` after it removed an item.
+When the result must not be lost to a timer, race the deadline inside the task, as the example below does. This needs Effect 4.0.2 or later. On 4.0.0 and 4.0.1, a waiting take under `Effect.raceFirst` or `Effect.timeoutOption` can lose an item to the deadline after it removed it.
 
 The example's raced branch is `Queue.take` followed by one `Effect.map`. `Queue.take` removes an item and returns it in one step, and `Effect.raceFirst` interrupts the losing branch before the winner's step ends. That branch therefore either wins with the item or ends without removing it, even when the item arrives at the instant the deadline fires. This rests on Effect's implementation, with its default scheduler and `Scheduler.MaxOpsBeforeYield`.
 
@@ -102,7 +102,7 @@ A different branch keeps that property only if its take stays interruptible and 
 
 - An asynchronous step after the take, as in `Queue.take(q).pipe(Effect.flatMap(save))`, or a yield with `Effect.yieldNow`.
 - More than about 2,000 Effect operations in the step that takes the item, counting those before the take, because the fiber then yields. A slow function inside one `Effect.map` counts as one operation.
-- `Effect.uninterruptible` around the take.
+- `Effect.uninterruptible` around the take. The task then reports no deadline until an item arrives, and loses that item.
 - A child fiber forked with `Effect.forkChild` whose cleanup takes time, because the branch waits for that cleanup before it finishes.
 - Code that ends the deadline from inside the step that takes the item, such as a hand-written `Clock` woken there or a `dispatcher.flush()` called there.
 

@@ -125,6 +125,18 @@ const machines = {
         )
       )
   ),
+  // The child's cleanup waits for a real millisecond.
+  'Effect.raceFirst and a forked child with slow cleanup': raceFirst(
+    (messages) =>
+      Effect.forkChild(
+        Effect.never.pipe(
+          Effect.ensuring(
+            Effect.promise(() => new Promise((done) => setTimeout(done, 1)))
+          )
+        ),
+        { startImmediately: true }
+      ).pipe(Effect.andThen(takeMessage(messages)))
+  ),
   'Effect.timeoutOption': timeoutOption,
   'an `after` timer': afterTimer,
   'an `after` timer in a nested machine': createParentMachine(afterTimer)
@@ -240,7 +252,8 @@ const outcomes = {
 };
 
 // No row covers the operation budget, whose threshold is an Effect internal.
-// A row that expects a loss is a deliberate alarm for an Effect upgrade.
+// A row that expects a loss is a deliberate alarm. The `after` rows depend on
+// the root mailbox in createEffectActor.ts, and the others on Effect.
 describe('a message that arrives at the instant the timer ends', () => {
   it.each([
     ['Effect.raceFirst', 'offered before the timer ends', 'keeps it queued'],
@@ -251,6 +264,11 @@ describe('a message that arrives at the instant the timer ends', () => {
     ],
     [
       'Effect.raceFirst and an asynchronous save after the take',
+      'offered to the waiting take before the timer ends',
+      'loses it'
+    ],
+    [
+      'Effect.raceFirst and a forked child with slow cleanup',
       'offered to the waiting take before the timer ends',
       'loses it'
     ],
@@ -293,13 +311,48 @@ describe('a message that arrives at the instant the timer ends', () => {
       expect(result).toEqual(outcomes[expected]);
     }
   );
+
+  it('with Effect.uninterruptible around the take, reports no deadline until a message arrives, and loses it', async () => {
+    const machine = raceFirst((messages) =>
+      Queue.take(messages).pipe(Effect.uninterruptible, Effect.map(toMessage))
+    );
+    const result = await run(({ started, wake }) =>
+      Effect.gen(function* () {
+        const messages = yield* Messages;
+        const actor = yield* createEffectActor(machine);
+        yield* started(4_000);
+        yield* Effect.sync(() => wake(4_000));
+        for (let i = 0; i < 10; i++) yield* Effect.yieldNow;
+        const valueAfterDeadline = actor.getSnapshot().value;
+        yield* Queue.offer(messages, 'config changed');
+        return { valueAfterDeadline, ...(yield* outcome(actor, messages)) };
+      })
+    );
+    expect(result).toEqual({
+      valueAfterDeadline: 'waiting',
+      ...outcomes['loses it']
+    });
+  });
 });
 
-// Ties on the real clock, with the offer armed before or after the actor
-// starts. Real timers do not promise an order, so either winner is valid.
+// Ties on the real clock, with the offer armed before or after the task arms
+// its deadline. Real timers do not promise an order, so either winner is valid.
 it('keeps the message at ties with Effect.raceFirst on the real clock', async () => {
-  const machine = raceFirst(takeMessage, 5);
+  let deadlineArmed = false;
+  const machine = createRetryMachine(
+    Messages.use((messages) =>
+      Effect.raceFirst(
+        takeMessage(messages),
+        // Sets the flag in the step that arms the sleep.
+        Effect.sync(() => (deadlineArmed = true)).pipe(
+          Effect.andThen(Effect.sleep(5)),
+          Effect.as({ kind: 'deadline' as const })
+        )
+      )
+    )
+  );
   for (const messageFirst of [true, false, true, false, true, false]) {
+    deadlineArmed = false;
     const result = await Effect.gen(function* () {
       const messages = yield* Queue.unbounded<string>();
       const offer = () =>
@@ -313,6 +366,8 @@ it('keeps the message at ties with Effect.raceFirst on the real clock', async ()
       const actor = yield* createEffectActor(machine).pipe(
         Effect.provideService(Messages, messages)
       );
+      for (let i = 0; i < 100 && !deadlineArmed; i++) yield* Effect.yieldNow;
+      expect(deadlineArmed).toBe(true);
       yield* Effect.promise(() => early ?? offer());
       return yield* outcome(actor, messages);
     }).pipe(Effect.scoped, Effect.runPromise);
@@ -401,6 +456,7 @@ describe('the core deadline example under createEffectActor', () => {
           const [child] = Object.values(actor.getSnapshot().children);
           for (let i = 0; i < 100 && child.getSnapshot().status !== 'done'; i++)
             await Promise.resolve();
+          expect(child.getSnapshot().status).toBe('done');
           vi.advanceTimersByTime(1);
           return actor.getSnapshot().value;
         });
@@ -415,6 +471,8 @@ describe('the core deadline example under createEffectActor', () => {
     });
   });
 
+  // Delete this test and the guide sentence about TestClock when this timeout
+  // moves to the Effect clock.
   it('runs an async logic timeout on the global timers, not on TestClock', async () => {
     const values = await Effect.runPromise(
       Effect.gen(function* () {
