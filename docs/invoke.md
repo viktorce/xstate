@@ -299,7 +299,7 @@ With the default clock, the built-in runtime delivers a timer in the turn that f
 - A take that settles later. It removes the item in one turn and settles in a later one, such as a request to a queue server.
 - An exit in the same turn. The take settles in the turn that exits the state. That happens when code offers the item and sends an event that exits the state in the same turn, when an `exit` action that runs before the child stops offers the item, or when advancing a [simulated clock](testing.md#control-time) or synchronous fake timers fires the timer.
 
-A host runs the root actor and delivers its events. One that queues events, such as `createEffectActor`, handles an event later than it was sent. A child can take an item in between, and its completion waits behind the timer.
+A host that queues the root actor's events, such as `createEffectActor`, handles an event later than it was sent. A child can take an item in between, and its completion waits behind the timer.
 
 ### Rules for the child
 
