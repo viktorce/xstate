@@ -139,7 +139,7 @@ Registered action keys also identify their transition descriptors. See [Action d
 | [Actors](docs/actors.md) | Share an actor through a Layer and ManagedRuntime. |
 | [Observing actors](docs/observing-actors.md) | Snapshot history, output and streamed reminders. |
 | [Matching states](docs/matching-states.md) | Exhaustive matching and per-state context. |
-| [Effect actor logic](docs/effect-logic.md) | Report tasks, upload progress and rollout health events. |
+| [Effect actor logic](docs/effect-logic.md) | Report tasks, a queue take raced against a deadline, upload progress and rollout health events. |
 | [Schemas and actions](docs/schemas-and-actions.md) | Runtime event validation and background audit entries. |
 | [Atoms and React](docs/atoms-and-react.md) | Registry ownership, approval controls and useSelector. |
 | [Testing and errors](docs/testing-and-errors.md) | TestClock, task retries, supervision and typed failures. |

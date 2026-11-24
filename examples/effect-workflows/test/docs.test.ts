@@ -88,6 +88,7 @@ describe('runnable examples', () => {
     ['parallel', 'Build in progress'],
     ['actions', 'approved'],
     ['retry', 'published'],
+    ['deadline', { value: 'retryNow', message: 'config changed' }],
     ['supervision', 'complete'],
     ['errors', 'Release needs approval'],
     ['atoms', 'approved']

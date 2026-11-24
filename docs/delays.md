@@ -68,6 +68,8 @@ Common examples include:
 - waiting before retrying a failed request
 - debouncing search input by canceling the previous delayed event
 
+`after` does not wait for a child invoked on the same state. The timer and the child's completion are separate events, and a timer transition that exits the state stops the child and loses a result it has not reported. See [racing an invocation against a timer](invoke.md#racing-an-invocation-against-a-timer).
+
 ## Persistence
 
 With the default clock, saving a running actor and restoring it preserves each timer's original deadline, including downtime. Pause/resume and full-delay restart require explicit application behavior. Clocks exposing `now()`, including `SimulatedClock`, restart the declared delay on ordinary actor restoration. See [Persist timers](persistence.md#persist-timers) for the policies, clock limitations and complete examples.

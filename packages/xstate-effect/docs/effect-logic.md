@@ -88,6 +88,100 @@ Use Effect's retry and timeout combinators inside the task.
 
 </details>
 
+### Racing a deadline
+
+A state timer can make the machine lose an item that an invoked task already took. If the timer's transition exits the invoking state before the machine handles the task's result, the machine stops the task, and nothing reports the loss as an error. The core guide explains [what stops a child](../../../docs/invoke.md#racing-an-invocation-against-a-timer).
+
+An `after`, a state `timeout` or an invoke `timeout` is one event, and the task's result is another. The root machine under `createEffectActor` receives events through one mailbox and handles them in the order they arrive. The timer's event can already be in the mailbox when the task takes an item from a `Queue`. That can happen even if the item was offered before the timer fired, because Effect can resume a waiting `Queue.take` on a later step. A step here is one run of a fiber, from when it resumes until it waits, yields or ends, together with the fibers it resumes synchronously, such as a race waiting for it. The item the task took is lost, whether the task was still running or had already finished and queued its result behind the timer.
+
+A nested machine receives its events directly and handles the timer when it fires, so the root mailbox delay does not apply to it, but the [same-turn case](../../../docs/invoke.md#when-the-loss-happens) in the core guide still applies. A task there still needs an interruptible take, and must finish in the step that takes the item, cleanup included.
+
+When the result must not be lost to a timer, race the deadline inside the task, as the example below does. This needs Effect 4.0.2 or later. On 4.0.0 and 4.0.1, a waiting take under `Effect.raceFirst` or `Effect.timeoutOption` can lose an item to the deadline after it removed it.
+
+<!-- example from examples/effect-workflows/src/deadline.ts -->
+
+```ts
+import { Context, Effect, Queue } from 'effect';
+import {
+  createEffectActor,
+  createEffectLogic,
+  setupEffect,
+  waitFor
+} from '@xstate/effect';
+
+export class Messages extends Context.Service<Messages, Queue.Queue<string>>()(
+  '@app/Messages'
+) {}
+
+// One Effect owns both outcomes. The take branch is Queue.take and one
+// Effect.map, so it finishes in the step that removes the item. When the
+// deadline wins, the race interrupts the take before it removes anything.
+const nextMessage = createEffectLogic(
+  Messages.use((messages) =>
+    Effect.raceFirst(
+      Queue.take(messages).pipe(
+        Effect.map((message) => ({ kind: 'message' as const, message }))
+      ),
+      Effect.sleep('4 seconds').pipe(Effect.as({ kind: 'deadline' as const }))
+    )
+  )
+);
+
+export const retryMachine = setupEffect({
+  actors: { nextMessage }
+}).createMachine({
+  context: { message: null as string | null },
+  initial: 'waiting',
+  states: {
+    waiting: {
+      invoke: {
+        src: 'nextMessage',
+        onDone: ({ event }) =>
+          event.output.kind === 'message'
+            ? { target: 'retryNow', context: { message: event.output.message } }
+            : { target: 'retryLater' }
+      }
+    },
+    retryNow: { type: 'final' },
+    retryLater: { type: 'final' }
+  }
+});
+
+const program = Effect.gen(function* () {
+  const messages = yield* Queue.unbounded<string>();
+  const actor = yield* createEffectActor(retryMachine).pipe(
+    Effect.provideService(Messages, messages)
+  );
+  yield* Queue.offer(messages, 'config changed');
+  const { value, context } = yield* waitFor(actor, (s) => s.status === 'done');
+  return { value, message: context.message };
+});
+
+export const result = await Effect.runPromise(Effect.scoped(program));
+console.log(result); // { value: 'retryNow', message: 'config changed' }
+```
+
+The example's raced branch is `Queue.take` followed by one `Effect.map`. `Queue.take` removes an item and returns it in one step, and `Effect.raceFirst` interrupts the losing branch before the winner's step ends. That branch therefore either wins with the item or ends without removing it, even when the item arrives at the instant the deadline fires. This rests on Effect's implementation, with the default scheduler and the default `Scheduler.MaxOpsBeforeYield`, and on nothing ending the deadline from inside the step that takes the item. Effect's default `Clock` and `TestClock` never do that. A hand-written `Clock` can.
+
+A different branch keeps that property only if its take stays interruptible and the branch finishes in the step that takes the item. Each of these breaks it:
+
+- An asynchronous step after the take, as in `Queue.take(q).pipe(Effect.flatMap(save))`, or a yield with `Effect.yieldNow`.
+- More than about 2,000 Effect operations in the step that takes the item, counting those before the take, because the fiber then yields. A slow function inside one `Effect.map` counts as one operation.
+- `Effect.uninterruptible` around the take. The race then waits for the take after the deadline wins, and loses any item the take consumes during that wait.
+- A child fiber forked with `Effect.forkChild` whose cleanup is asynchronous, because the branch waits for that cleanup before it finishes.
+
+About the example:
+
+- `onDone` handles both outcomes, so no machine timer competes with the task. Another transition out of `waiting`, an explicit `enq.stop` of the task, or stopping the actor can still lose an item the task took.
+- The consuming call must either finish with the item or leave it in the source when interrupted. `Queue.take` does. Other sources may not.
+- `Effect.timeoutOption` and `Effect.timeout`, which is built on it, run the same race under the same conditions. At the deadline, `Effect.timeoutOption` returns `Option.none()` and `Effect.timeout` fails with a `Cause.TimeoutError`, which reaches `onError` wrapped in an [`EffectFailure`](testing-and-errors.md#migrating-error-handlers).
+- The deadline restarts in full when the actor is restored, because a running Effect task starts again from the beginning. A pending `after` timer keeps its original deadline. See [persisting and restoring](actors.md#persisting-and-restoring).
+- Keep `after` and `timeout` for work that is safe to repeat or abandon.
+
+For an item that must survive in every case, use [reserve, then commit](../../../docs/invoke.md#reserve-then-commit).
+
+If you use the core guide's `createAsyncLogic` [deadline](../../../docs/invoke.md#a-deadline-inside-the-logic) under `createEffectActor`, its `timeout` currently runs on the global timers, not on Effect's `Clock`, so `TestClock` does not advance it.
+
 ## `createEffectStreamLogic`
 
 Use `createEffectStreamLogic` when consumers need the latest value. For example, upload progress becomes the actor's snapshot context:

@@ -258,6 +258,191 @@ authorizing: {
 
 Setting `timeout` without `onTimeout` throws when the machine is created in development builds. Use `createAsyncLogic({ timeout })` instead when the timeout belongs to the logic rather than to this particular invocation. See [timeouts](timeouts.md).
 
+## Racing an invocation against a timer
+
+When a timer's transition exits the invoking state before the child reports, the machine stops the child and the result never reaches `onDone`. An `after`, a state `timeout` and an invoke `timeout` each arrive as one event, and the child's completion is another. Stopping a child does not undo its work, such as taking an item from a queue. Nothing reports the loss as an error, and a queue that does not redeliver loses the item for good.
+
+An explicit `enq.stop` of the child also loses a result the child has not sent yet, and stopping the parent loses any result it has not handled.
+
+### Pick a remedy
+
+If only a simulated clock or synchronous fake timers lose the item, see the [note under the rules](#rules-for-the-child).
+
+A turn is one event-loop callback, such as a timer firing, plus the promise callbacks that run after it. Use the first entry that fits:
+
+- Your queue is on another server, or your take cannot be withdrawn. Use [reserve, then commit](#reserve-then-commit).
+- The take can settle in the turn that exits the state, as in [an exit in the same turn](#when-the-loss-happens). Use reserve, then commit.
+- Your host queues the root actor's events, as `createEffectActor` does. Follow the [rules for the child](#rules-for-the-child) and move the [deadline inside the logic](#a-deadline-inside-the-logic). For a `createEffectLogic` child, follow [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide instead. If any other event can exit the state, use reserve, then commit.
+- You run `createActor`, the [built-in runtime](durable-execution.md#driving-effects-yourself), with the default clock, real timers and an in-memory queue, and nothing settles the take in the turn that exits the state. Follow the rules for the child and keep the machine timer.
+
+Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before you retry work whose result was lost.
+
+### When the loss happens
+
+```ts
+waiting: {
+  // Whether this loses an item depends on the child. See below.
+  invoke: {
+    src: 'takeMessage',
+    onDone: ({ event }) => ({
+      target: 'retryNow',
+      context: { message: event.output }
+    })
+  },
+  after: { 4_000: { target: 'retryLater' } }
+}
+```
+
+With the default clock, the built-in runtime delivers a timer in the turn that fires it, and a child's completion in the turn its `run` promise settles. A child that finished before the timer fired wins. In that setup, a loss needs one of these cases:
+
+- A take that registers or keeps a request after `signal` aborted. See [rule 1](#rules-for-the-child). The request consumes the next item.
+- Asynchronous work after the take, such as saving the item before `run` returns.
+- A take that settles later. It removes the item in one turn and settles in a later one, such as a request to a queue server.
+- An exit in the same turn. The take settles in the turn that exits the state. That happens when code offers the item and sends an event that exits the state in the same turn, when an `exit` action that runs before the child stops offers the item, or when advancing a [simulated clock](testing.md#control-time) or synchronous fake timers fires the timer.
+
+A host that queues the root actor's events, such as `createEffectActor`, handles an event later than it was sent. A child can take an item in between, and its completion waits behind the timer.
+
+### Rules for the child
+
+These rules are for a `createAsyncLogic` child. A `createEffectLogic` child follows the `@xstate/effect` guide, and any other child that consumes something needs reserve, then commit. Here `take` is your queue's consuming call, and `run` receives an abort signal as `signal`. This child follows the rules:
+
+```ts
+createAsyncLogic({
+  run: ({ signal }) => messages.take(signal)
+});
+```
+
+1. If `signal` has already aborted, `take` must reject without registering a request. If it aborts later, `take` must withdraw its pending request synchronously, in the abort listener.
+2. Once the take settles, `run` returns its value without awaiting anything else. Synchronous mapping is fine. To save the item, return it and save it in the next state.
+3. `take` must remove the item in the same turn that settles its promise. A take that settles later needs [reserve, then commit](#reserve-then-commit).
+
+If the timer's transition exits the state first, the machine stops the child, which aborts `signal`, and the item stays queued.
+
+The rules do not cover an exit in the same turn. With a simulated clock or synchronous fake timers, advance the clock after the turn that settles the take.
+
+### A deadline inside the logic
+
+Async logic with a `timeout` aborts `signal` at the deadline, and only then errors with a `TimeoutError`. The child picks one outcome itself, and no machine timer races its completion. The four cases under [when the loss happens](#when-the-loss-happens) still apply. The same-turn case applies to the turn that fires the deadline, so advance a simulated clock or synchronous fake timers after the turn that settles the take. The example assumes an in-memory queue that follows rules 1 and 3:
+
+<!-- tested example: packages/core/test/fixtures/invoke-deadline/take-or-deadline.ts -->
+```ts
+import { createAsyncLogic, setup, TimeoutError } from 'xstate';
+
+/**
+ * Your own queue. `take` must reject at once if `signal` has already aborted,
+ * and withdraw its pending request in the abort listener if it aborts later.
+ * It must remove the item in the turn that settles its promise.
+ */
+export interface MessageQueue {
+  take(signal: AbortSignal): Promise<string>;
+}
+
+export function createRetryMachine(messages: MessageQueue) {
+  // The logic owns the deadline. After four seconds it aborts `signal`,
+  // which withdraws the pending take, and then errors with a TimeoutError.
+  // The return type gives `onDone` a typed `event.output`.
+  const takeMessage = createAsyncLogic({
+    timeout: 4_000,
+    run: ({ signal }): Promise<string> => messages.take(signal)
+  });
+
+  return setup({ actors: { takeMessage } }).createMachine({
+    context: { message: null as string | null },
+    initial: 'waiting',
+    states: {
+      waiting: {
+        invoke: {
+          src: 'takeMessage',
+          onDone: ({ event }) => ({
+            target: 'retryNow',
+            context: { message: event.output }
+          }),
+          onError: ({ event }) => ({
+            target:
+              event.error instanceof TimeoutError ? 'retryLater' : 'failed'
+          })
+        }
+      },
+      retryNow: {},
+      retryLater: {},
+      failed: {}
+    }
+  });
+}
+```
+
+On restore, an `after` timer keeps its [original deadline](persistence.md#preserve-the-original-deadline) with the default clock, but an async child [runs again](persistence.md#in-flight-children) and its `timeout` restarts in full.
+
+### Reserve, then commit
+
+When an item must survive any exit from the state, split the take into a reserve and a commit, with the work between them. The example assumes a broker that offers an uncommitted item again when its reservation expires, as a visibility timeout does. With manual acknowledgements, find out what returns an abandoned reservation. This also covers a take that settles later and an exit in the same turn. The example keeps a plain `after`. If the timer exits while a reservation is held, the job returns when the reservation expires:
+
+<!-- tested example: packages/core/test/fixtures/invoke-deadline/reserve-then-commit.ts -->
+```ts
+import { createAsyncLogic, setup } from 'xstate';
+
+type Job = { id: string; payload: string };
+type Reservation = { receipt: string; job: Job };
+
+/** Your broker. A reservation hides the job until it is committed or expires. */
+export interface JobQueue {
+  reserve(signal: AbortSignal): Promise<Reservation>;
+  commit(receipt: string): Promise<void>;
+}
+
+export function createJobMachine(
+  jobs: JobQueue,
+  work: (job: Job) => Promise<void>
+) {
+  const reserveJob = createAsyncLogic({
+    run: ({ signal }): Promise<Reservation> => jobs.reserve(signal)
+  });
+  const runJob = createAsyncLogic({
+    run: ({ input }: { input: Reservation }) => work(input.job)
+  });
+  const commitJob = createAsyncLogic({
+    run: ({ input }: { input: Reservation }) => jobs.commit(input.receipt)
+  });
+  return setup({ actors: { reserveJob, runJob, commitJob } }).createMachine({
+    context: { reservation: null as Reservation | null },
+    initial: 'waiting',
+    states: {
+      waiting: {
+        invoke: {
+          src: 'reserveJob',
+          onDone: ({ event }) => ({
+            target: 'working',
+            context: { reservation: event.output }
+          }),
+          onError: { target: 'idle' }
+        },
+        after: { 4_000: { target: 'idle' } }
+      },
+      working: {
+        invoke: {
+          src: 'runJob',
+          input: ({ context }) => context.reservation!,
+          onDone: { target: 'committing' },
+          onError: { target: 'idle' }
+        }
+      },
+      committing: {
+        invoke: {
+          src: 'commitJob',
+          input: ({ context }) => context.reservation!,
+          onDone: { target: 'done' },
+          onError: { target: 'idle' }
+        }
+      },
+      done: {},
+      idle: {}
+    }
+  });
+}
+```
+
+A job can arrive twice. The work can finish and the commit fail, or the reservation can expire before the commit, and the broker offers the job again with a new receipt. A failed commit can also mean the broker recorded the commit and the reply was lost, so the error does not tell whether the job returns. Make the work idempotent by keying its writes on the job id, not on the receipt or the payload, and make those writes safe when two attempts overlap. The reservation can start before the reply arrives, so reserve for longer than delivery, the work and the commit take together.
+
 ## Referencing the child
 
 Invoked children appear on `snapshot.children` under their `id`, and transition functions receive them as `children`:
