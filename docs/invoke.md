@@ -262,17 +262,18 @@ Setting `timeout` without `onTimeout` throws when the machine is created in deve
 
 When a timer's transition exits the invoking state before the child reports, the machine stops the child and the result never reaches `onDone`. An `after`, a state `timeout` and an invoke `timeout` each arrive as one event, and the child's completion is another. Stopping a child does not undo its work, such as taking an item from a queue. Nothing reports the loss as an error, and a queue that does not redeliver loses the item for good.
 
-An explicit `enq.stop` of the child also loses a result the child has not sent yet, and stopping the parent loses any result it has not handled. A targetless `onDone` handles the completion and stays in the state, so a later `after` or state `timeout` can exit without losing the result.
+An explicit `enq.stop` of the child also loses a result the child has not sent yet, and stopping the parent loses any result it has not handled.
 
 ### Pick a remedy
 
+If only a simulated clock or synchronous fake timers lose the item, see the [note under the rules](#rules-for-the-child).
+
 A turn is one event-loop callback, such as a timer firing, plus the promise callbacks that run after it. Use the first entry that fits:
 
-- Your queue is on another server, your take cannot be withdrawn, or the take can settle in the turn that exits the state, as when the code that offers the item also sends an event that exits the state. Use [reserve, then commit](#reserve-then-commit).
-- Your host queues the root actor's events, as `createEffectActor` does. Nested machines get theirs directly. Follow the [rules for the child](#rules-for-the-child) and move the [deadline inside the logic](#a-deadline-inside-the-logic). For a `createEffectLogic` child, follow [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide instead. If any other event can exit the state, use reserve, then commit.
+- Your queue is on another server, or your take cannot be withdrawn. Use [reserve, then commit](#reserve-then-commit).
+- The take can settle in the turn that exits the state, as in [an exit in the same turn](#when-the-loss-happens). Use reserve, then commit.
+- Your host queues the root actor's events, as `createEffectActor` does. Follow the [rules for the child](#rules-for-the-child) and move the [deadline inside the logic](#a-deadline-inside-the-logic). For a `createEffectLogic` child, follow [racing a deadline](https://github.com/statelyai/xstate/blob/next/packages/xstate-effect/docs/effect-logic.md#racing-a-deadline) in the `@xstate/effect` guide instead. If any other event can exit the state, use reserve, then commit.
 - You run `createActor`, the [built-in runtime](durable-execution.md#driving-effects-yourself), with the default clock, real timers and an in-memory queue, and nothing settles the take in the turn that exits the state. Follow the rules for the child and keep the machine timer.
-
-If only a simulated clock or synchronous fake timers lose the item, see the [note under the rules](#rules-for-the-child).
 
 Read the [warning about writes](retries-and-timeouts.md#give-up-somewhere) before you retry work whose result was lost.
 
@@ -303,7 +304,7 @@ A host that queues the root actor's events, such as `createEffectActor`, handles
 
 ### Rules for the child
 
-Here `take` is your queue's consuming call, and `run` receives an abort signal as `signal`. This child follows the rules:
+These rules are for a `createAsyncLogic` child. A `createEffectLogic` child follows the `@xstate/effect` guide, and any other child that consumes something needs reserve, then commit. Here `take` is your queue's consuming call, and `run` receives an abort signal as `signal`. This child follows the rules:
 
 ```ts
 createAsyncLogic({
@@ -330,6 +331,7 @@ import { createAsyncLogic, setup, TimeoutError } from 'xstate';
 /**
  * Your own queue. `take` must reject at once if `signal` has already aborted,
  * and withdraw its pending request in the abort listener if it aborts later.
+ * It must remove the item in the turn that settles its promise.
  */
 export interface MessageQueue {
   take(signal: AbortSignal): Promise<string>;
@@ -373,7 +375,7 @@ On restore, an `after` timer keeps its [original deadline](persistence.md#preser
 
 ### Reserve, then commit
 
-When an item must survive any exit from the state, split the take into a reserve and a commit, with the work between them. The example assumes a broker that offers an uncommitted item again when its reservation expires, as a visibility timeout does. With manual acknowledgements, find out what returns an abandoned reservation. This also covers a take that settles later and an exit in the same turn. A plain `after` does not lose the job. A job abandoned this way returns when its reservation expires:
+When an item must survive any exit from the state, split the take into a reserve and a commit, with the work between them. The example assumes a broker that offers an uncommitted item again when its reservation expires, as a visibility timeout does. With manual acknowledgements, find out what returns an abandoned reservation. This also covers a take that settles later and an exit in the same turn. The example keeps a plain `after`. If the timer exits while a reservation is held, the job returns when the reservation expires:
 
 <!-- tested example: packages/core/test/fixtures/invoke-deadline/reserve-then-commit.ts -->
 ```ts
